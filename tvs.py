@@ -297,6 +297,111 @@ def parse_angle(value, unit=u.deg):
     return angle
 
 
+def _validate_day_obs(day_obs):
+    """Sanity-check that an 8-digit day_obs encodes a plausible date.
+
+    Parameters
+    ----------
+    day_obs : int
+        Date in YYYYMMDD form.
+
+    Raises
+    ------
+    click.BadParameter
+        If the embedded year/month/day are out of plausible range.
+    """
+    year, month, day = day_obs // 10000, (day_obs // 100) % 100, day_obs % 100
+    if not (2019 <= year <= 2035 and 1 <= month <= 12 and 1 <= day <= 31):
+        raise click.BadParameter(
+            f"day_obs {day_obs} does not encode a plausible date "
+            f"(expected YYYYMMDD with year 2019-2035)."
+        )
+
+
+def parse_visit_id(visit):
+    """Validate a 13-digit visit ID and return (visit, day_obs).
+
+    Visit IDs are YYYYMMDD followed by a 5-digit sequence number.
+
+    Parameters
+    ----------
+    visit : int
+        Visit ID to validate.
+
+    Returns
+    -------
+    visit : int
+        Validated visit ID.
+    day_obs : int
+        Embedded day_obs (YYYYMMDD).
+
+    Raises
+    ------
+    click.BadParameter
+        If the visit ID is not 13 digits or the embedded date is implausible.
+    """
+    s = str(visit)
+    if len(s) != 13:
+        raise click.BadParameter(
+            f"Visit ID must be 13 digits (YYYYMMDD + 5-digit sequence); "
+            f"got {len(s)} digits: {s!r}. "
+            f"Did you drop a leading zero on the sequence number?"
+        )
+    day_obs = int(s[:8])
+    _validate_day_obs(day_obs)
+    return int(visit), day_obs
+
+
+def parse_day_obs(day_obs):
+    """Validate an 8-digit day_obs (YYYYMMDD).
+
+    Parameters
+    ----------
+    day_obs : int
+        day_obs to validate.
+
+    Returns
+    -------
+    int
+        Validated day_obs.
+
+    Raises
+    ------
+    click.BadParameter
+        If day_obs is not 8 digits or encodes an implausible date.
+    """
+    s = str(day_obs)
+    if len(s) != 8:
+        raise click.BadParameter(
+            f"day_obs must be 8 digits (YYYYMMDD); got {len(s)}: {s!r}."
+        )
+    _validate_day_obs(int(day_obs))
+    return int(day_obs)
+
+
+def infer_camera(day_obs):
+    """Infer the camera in use from a day_obs.
+
+    Parameters
+    ----------
+    day_obs : int
+        Date in YYYYMMDD form.
+
+    Returns
+    -------
+    str
+        Inferred camera name.
+    """
+    if day_obs < 20241023:
+        return "LATISS"
+    elif day_obs < 20241212:
+        return "ComCam"
+    elif day_obs < 20250415:
+        return "LATISS"
+    else:
+        return "LSSTCam"
+
+
 def get_stellarium_attributes(url):
     """Get particular Stellarium attributes of interest.
 
@@ -846,23 +951,15 @@ def visit(
     """
     api_url = ctx.obj["URL"]
 
+    visit, day_obs = parse_visit_id(visit)
+
     token = get_access_token(rsp_token)
     consdb = ConsDB(rsp_server, token)
 
     # Override camera by date if possible:
     if camera is None:
-        if visit < 2024102300000:
-            print("Inferring camera is LATISS")
-            camera = "LATISS"
-        elif visit < 2024121200000:
-            print("Inferring camera is ComCam")
-            camera = "ComCam"
-        elif visit < 2025041500000:
-            print("Inferring camera is LATISS")
-            camera = "LATISS"
-        else:
-            print("Inferring camera is LSSTCam")
-            camera = "LSSTCam"
+        camera = infer_camera(day_obs)
+        print(f"Inferring camera is {camera}")
 
     if camera == "ComCam":
         database = "cdb_lsstcomcam"
@@ -897,7 +994,14 @@ def visit(
     if ra is None:
         print("Using ConsDB for coordinates")
         query = f"select * from {database}.visit1 where visit_id = {visit}"
-        data = consdb.query(query)[0]
+        result = consdb.query(query)
+        if len(result) == 0:
+            raise click.ClickException(
+                f"No visit {visit} found in {database}.visit1. "
+                f"Check the visit ID and that the camera/database is correct "
+                f"(inferred camera: {camera})."
+            )
+        data = result[0]
         ra = Angle(data["s_ra"] * u.deg)
         dec = Angle(data["s_dec"] * u.deg)
         rsp = Angle(data["sky_rotation"] * u.deg)
@@ -961,25 +1065,20 @@ def replay(
     """
     api_url = ctx.obj["URL"]
 
+    day_obs_begin = parse_day_obs(day_obs_begin)
     if day_obs_end is None:
         day_obs_end = day_obs_begin
+    else:
+        day_obs_end = parse_day_obs(day_obs_end)
     if day_obs_end < day_obs_begin:
-        raise ValueError("DAY_OBS_END must be greater than or equal to DAY_OBS_BEGIN")
+        raise click.BadParameter(
+            "DAY_OBS_END must be greater than or equal to DAY_OBS_BEGIN"
+        )
 
     # Try to infer the camera
     if camera is None:
-        if day_obs_end < 20241023:
-            print("Inferring camera is LATISS")
-            camera = "LATISS"
-        elif day_obs_end < 20241212 and day_obs_begin > 20241023:
-            print("Inferring camera is ComCam")
-            camera = "ComCam"
-        elif day_obs_end < 20250415 and day_obs_begin > 20241212:
-            print("Inferring camera is LATISS")
-            camera = "LATISS"
-        else:
-            print("Inferring camera is LSSTCam")
-            camera = "LSSTCam"
+        camera = infer_camera(day_obs_begin)
+        print(f"Inferring camera is {camera}")
 
     token = get_access_token(rsp_token)
     consdb = ConsDB(rsp_server, token)
@@ -997,13 +1096,25 @@ def replay(
         f"select * from {database}.visit1 where day_obs >= {day_obs_begin}"
         f" and day_obs <= {day_obs_end}"
     )
+    if len(visits) == 0:
+        raise click.ClickException(
+            f"No visits found in {database}.visit1 for day_obs range "
+            f"{day_obs_begin}-{day_obs_end} "
+            f"(inferred camera: {camera})."
+        )
     visits["s_ra"] = visits["s_ra"].astype(float)
     visits["s_dec"] = visits["s_dec"].astype(float)
     visits["sky_rotation"] = visits["sky_rotation"].astype(float)
     visits["exp_midpt_mjd"] = visits["exp_midpt_mjd"].astype(float)
 
     # Set stellarium time to first visit with can_see_sky True
-    visit0 = visits[visits["can_see_sky"]][0]
+    can_see_sky = visits[visits["can_see_sky"]]
+    if len(can_see_sky) == 0:
+        raise click.ClickException(
+            f"No visits in day_obs range {day_obs_begin}-{day_obs_end} "
+            f"could see sky (can_see_sky is False for all)."
+        )
+    visit0 = can_see_sky[0]
     set_stellarium_time(
         api_url,
         Time(visit0["exp_midpt_mjd"], format="mjd"),
