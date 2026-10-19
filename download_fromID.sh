@@ -41,13 +41,17 @@ while read -r ID || [ -n "$ID" ]; do
     NUM=$(printf "%06d" "$IMGNUM")
 
     PREFIX="lsstcam_focal_plane_mosaic_${DATE}_"
-    URL="${BASE_URL}/${PREFIX}${NUM}.jpg"
+    URL="${BASE_URL}/${PREFIX}${NUM}.png"
 
 
-    OUTFILE="${OUTDIR}/${ID}.jpg"
+    OUTFILE="${OUTDIR}/${ID}.png"
 
     echo "Downloading $ID"
-    curl -s -L -b "$COOKIES" -o "$OUTFILE" "$URL"
+    if [ -f "$COOKIES" ]; then
+        curl -s -k -L -b "$COOKIES" -o "$OUTFILE" "$URL"
+    else
+        curl -s -k -L -o "$OUTFILE" "$URL"
+    fi
 
     if file "$OUTFILE" | grep -q "HTML"; then
         echo "  ⚠ Authentication failed (received HTML)"

@@ -18,7 +18,17 @@ try:
 except ImportError:
     HAS_COLORAMA = False
 
+try:
+    from PIL import Image
+
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 DEFAULT_STELLARIUM_URL = "http://localhost:8090"
+RUBINTV_BASE_URL = (
+    "https://usdf-rsp.slac.stanford.edu/rubintv/event_image/summit-usdf/lsstcam/focal_plane_mosaic"
+)
 CAMERA_CHOICES = ["LSSTCam", "ComCam", "LATISS"]
 DEFAULT_RSP_SERVER = "https://usdf-rsp.slac.stanford.edu"
 DEFAULT_RSP_TOKEN_PATH = "~/.lsst/rsp_token"
@@ -241,7 +251,176 @@ def set_camera(url, camera):
     requests.post(url, data={"id": "MosaicCamera.visible", "value": "True"})
 
 
-def slew_to(url, camera, ra, dec, rsp):
+def set_image_opacity(image_path, opacity=0.5, output_path=None):
+    """Set the opacity (alpha channel) of a PNG image to a given level (0.0 to 1.0).
+
+    Parameters
+    ----------
+    image_path : str or Path
+        Path to input image.
+    opacity : float
+        Opacity level between 0.0 and 1.0 (default: 0.5 for 50%).
+    output_path : str or Path, optional
+        Path to save output image. If None, overwrites input image.
+
+    Returns
+    -------
+    str
+        Path to modified image file.
+    """
+    if not HAS_PIL:
+        print("PIL/Pillow is not installed; cannot adjust image opacity.")
+        return str(image_path)
+
+    if output_path is None:
+        output_path = image_path
+
+    try:
+        img = Image.open(image_path).convert("RGBA")
+        r, g, b, a = img.split()
+        a = a.point(lambda p: int(p * opacity))
+        img = Image.merge("RGBA", (r, g, b, a))
+        img.save(output_path, "PNG")
+        return str(output_path)
+    except Exception as e:
+        print(f"Error applying opacity to {image_path}: {e}")
+        return str(image_path)
+
+
+def download_image_from_id(visit_id, outdir="images", cookies_file="cookies.txt", opacity=0.5):
+    """Download PNG image for a given visit ID from RubinTV and apply 50% opacity.
+
+    Parameters
+    ----------
+    visit_id : int or str
+        13-digit visit ID.
+    outdir : str
+        Directory to save downloaded image.
+    cookies_file : str
+        Path to cookies file (defaults to cookies.txt if present).
+    opacity : float
+        Opacity level for image (default: 0.5 for 50%).
+
+    Returns
+    -------
+    str or None
+        Path to downloaded PNG image file, or None if failed.
+    """
+    s = str(visit_id)
+    if len(s) != 13 or not s.isdigit():
+        print(f"Invalid visit ID for image download: {visit_id}")
+        return None
+
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+    out_path = outdir_path / f"{s}.png"
+
+    year, month, day = s[:4], s[4:6], s[6:8]
+    date_str = f"{year}-{month}-{day}"
+    img_num = int(s[8:])
+    num_str = f"{img_num:06d}"
+    prefix = f"lsstcam_focal_plane_mosaic_{date_str}_"
+    url = f"{RUBINTV_BASE_URL}/{prefix}{num_str}.png"
+
+    cookies = {}
+    cookies_path = Path(cookies_file)
+    if cookies_path.exists():
+        try:
+            import http.cookiejar
+
+            cj = http.cookiejar.MozillaCookieJar(cookies_path)
+            cj.load(ignore_discard=True, ignore_expires=True)
+            cookies = requests.utils.dict_from_cookiejar(cj)
+        except Exception:
+            try:
+                with open(cookies_path, "r") as f:
+                    for line in f:
+                        if line.startswith("#") or not line.strip():
+                            continue
+                        parts = line.strip().split("\t")
+                        if len(parts) >= 7:
+                            cookies[parts[5]] = parts[6]
+            except Exception:
+                pass
+
+    downloaded = False
+    try:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        print(f"Downloading PNG image for {s} from {url}")
+        resp = requests.get(url, cookies=cookies, timeout=10, verify=False)
+        if resp.status_code == 200 and not resp.text.startswith("<!DOCTYPE html>"):
+            with open(out_path, "wb") as f:
+                f.write(resp.content)
+            downloaded = True
+            print(f"Downloaded PNG image to {out_path}")
+        else:
+            print(f"Could not fetch image from {url} (status {resp.status_code})")
+    except Exception as e:
+        print(f"Failed download attempt for {s}: {e}")
+
+    if not downloaded:
+        if out_path.exists():
+            print(f"Using existing local PNG image at {out_path}")
+        else:
+            if HAS_PIL:
+                print(f"Creating placeholder PNG image at {out_path}")
+                img = Image.new("RGBA", (500, 500), (100, 150, 200, 255))
+                img.save(out_path, "PNG")
+            else:
+                return None
+
+    if opacity is not None and HAS_PIL and out_path.exists():
+        set_image_opacity(out_path, opacity=opacity)
+
+    return str(out_path.resolve())
+
+
+def plot_sky_image(url, image_id, filepath, ra, dec, rotation, ang_size_deg=3.5):
+    """Plot PNG image in Stellarium at given position instead of detector grid.
+
+    Parameters
+    ----------
+    url : str
+        Stellarium API URL.
+    image_id : str
+        ID key for the sky image layer.
+    filepath : str
+        Path to local PNG image file.
+    ra : Angle
+        Right Ascension.
+    dec : Angle
+        Declination.
+    rotation : Angle
+        Rotator / rotation angle.
+    ang_size_deg : float
+        Angular size of image field in degrees (default: 3.5 deg for LSSTCam).
+    """
+    # Hide detector grid
+    try:
+        requests.post(
+            f"{url}/api/stelproperty/set", data={"id": "MosaicCamera.visible", "value": "False"}
+        )
+    except Exception:
+        pass
+
+    abs_path = str(Path(filepath).resolve())
+    ang_size_arcmin = float(ang_size_deg) * 60.0
+    script = (
+        f'core.loadSkyImage("{image_id}", "{abs_path}", '
+        f"{ra.deg:.6f}, {dec.deg:.6f}, {ang_size_arcmin:.2f}, {rotation.deg:.6f});"
+    )
+    try:
+        requests.post(f"{url}/api/scripts/direct", data={"code": script})
+        print(
+            f"Plotted PNG image {image_id} in Stellarium at RA={ra.deg:.4f}, Dec={dec.deg:.4f}"
+        )
+    except Exception as e:
+        print(f"Error plotting sky image in Stellarium: {e}")
+
+
+def slew_to(url, camera, ra, dec, rsp, show_grid=True):
     """Send camera repositioning command to Stellarium.
 
     Parameters
@@ -256,6 +435,8 @@ def slew_to(url, camera, ra, dec, rsp):
         Declination.
     rsp : Angle
         Rotator sky position (E of N).
+    show_grid : bool
+        Whether to show detector grid overlay (default True).
     """
     if not np.isfinite(ra):
         cprint(f"ra is not finite: {ra}", "bright_red")
@@ -267,7 +448,7 @@ def slew_to(url, camera, ra, dec, rsp):
     url = f"{url}/api/stelproperty/set"
     for data in [
         {"id": "MosaicCamera.currentCamera", "value": camera},
-        {"id": "MosaicCamera.visible", "value": "True"},
+        {"id": "MosaicCamera.visible", "value": "True" if show_grid else "False"},
         {"id": "MosaicCamera.ra", "value": ra.deg},
         {"id": "MosaicCamera.dec", "value": dec.deg},
         {"id": "MosaicCamera.rotation", "value": rsp.deg},
@@ -886,6 +1067,37 @@ def target(ctx, name, rot, time, timeformat, camera, horizon, no_follow):
 
 
 @cli.command()
+@click.argument("visit_id", type=int)
+@click.option(
+    "--outdir",
+    type=str,
+    default="images",
+    help="Directory to save downloaded image. [default: images]",
+)
+@click.option(
+    "--cookies",
+    type=str,
+    default="cookies.txt",
+    help="Path to cookies file. [default: cookies.txt]",
+)
+@click.option(
+    "--opacity",
+    type=float,
+    default=0.5,
+    help="Opacity level for downloaded image (0.0 to 1.0). [default: 0.5]",
+)
+def download(visit_id, outdir, cookies, opacity):
+    """Download PNG image for visit ID and set opacity to 50%."""
+    img_path = download_image_from_id(
+        visit_id, outdir=outdir, cookies_file=cookies, opacity=opacity
+    )
+    if img_path:
+        print(f"Saved PNG image with {int(opacity*100)}% opacity to {img_path}")
+    else:
+        print("Download failed.")
+
+
+@cli.command()
 @click.argument("visit", type=int)
 @click.option(
     "--camera",
@@ -921,9 +1133,29 @@ def target(ctx, name, rot, time, timeformat, camera, horizon, no_follow):
     help="Offset to apply to the RotSkyPos (E of N) angle.",
     default=None,
 )
+@click.option(
+    "--plot-grid",
+    is_flag=True,
+    help="Plot detector grid instead of PNG image.",
+)
+@click.option(
+    "--cookies",
+    type=str,
+    default="cookies.txt",
+    help="Path to cookies file for downloading RubinTV PNG images.",
+)
 @click.pass_context
 def visit(
-    ctx, visit, camera, force_consdb, rsp_token, rsp_server, no_follow, rot_offset
+    ctx,
+    visit,
+    camera,
+    force_consdb,
+    rsp_token,
+    rsp_server,
+    no_follow,
+    rot_offset,
+    plot_grid,
+    cookies,
 ):
     """Slew to match given visit ID.
 
@@ -1014,7 +1246,14 @@ def visit(
         ra,
         dec,
         rsp,
+        show_grid=plot_grid,
     )
+
+    if not plot_grid:
+        img_file = download_image_from_id(visit, cookies_file=cookies, opacity=0.5)
+        if img_file:
+            plot_sky_image(api_url, f"visit_{visit}", img_file, ra, dec, rsp)
+
     # Set visit time and pause with timerate=0
     set_stellarium_time(api_url, time, timerate=0)
     if not no_follow:

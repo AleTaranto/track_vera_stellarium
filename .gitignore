@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Cookies and downloaded images
+cookies.txt
+images/
+images_*/
