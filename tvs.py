@@ -1,4 +1,7 @@
 import os
+import subprocess
+import sys
+from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from time import sleep
 
@@ -9,6 +12,7 @@ import requests
 from astropy.coordinates import ICRS, AltAz, Angle, EarthLocation, SkyCoord
 from astropy.table import QTable, Table
 from astropy.time import Time
+from PIL import Image, ImageOps
 
 try:
     from colorama import init
@@ -23,6 +27,16 @@ CAMERA_CHOICES = ["LSSTCam", "ComCam", "LATISS"]
 DEFAULT_RSP_SERVER = "https://usdf-rsp.slac.stanford.edu"
 DEFAULT_RSP_TOKEN_PATH = "~/.lsst/rsp_token"
 DEFAULT_EFD_CLIENT = "usdf_efd"
+DEFAULT_RUBINTV_MOSAIC_PATH = (
+    "/rubintv/streamer-s3/usdf_Butler/lsstcam/focal_plane_mosaic"
+)
+DEFAULT_COOKIES_PATH = "cookies.txt"
+DEFAULT_IMAGE_DIR = "images_rubin"
+DEFAULT_SKY_LAYER_ID = "rubin_focal_plane"
+DEFAULT_IMAGE_OPACITY = 0.25  # Opacity of the plotted Rubin sky image (0.0 to 1.0, e.g. 0.25 = 25%)
+# Exact half-spans of LSSTCam focal plane in radians from Stellarium's LSSTCam.json
+LSSTCAM_HALF_X_RAD = 0.03069328
+LSSTCAM_HALF_Y_RAD = 0.03064734
 # Using Stellarium values for Cerro Pachón
 RUBIN_OBSERVATORY = EarthLocation(
     lat=Angle("-30d14m27.00s"),
@@ -226,7 +240,7 @@ def parallactic_angle(coord, time):
     return Angle(np.arctan2(sinq, cosq))
 
 
-def set_camera(url, camera):
+def set_camera(url, camera, visible=True):
     """Set the camera in Stellarium.
 
     Parameters
@@ -235,13 +249,300 @@ def set_camera(url, camera):
         URL of Stellarium API.
     camera : str
         Camera to set.
+    visible : bool, optional
+        Whether the MosaicCamera detector wireframe grid is visible.
     """
     url = f"{url}/api/stelproperty/set"
     requests.post(url, data={"id": "MosaicCamera.currentCamera", "value": camera})
-    requests.post(url, data={"id": "MosaicCamera.visible", "value": "True"})
+    requests.post(
+        url,
+        data={"id": "MosaicCamera.visible", "value": "True" if visible else "False"},
+    )
 
 
-def slew_to(url, camera, ra, dec, rsp):
+def get_stellarium_scripts_dir() -> Path:
+    """Return Stellarium's user scripts directory where core.loadSkyImage looks up files."""
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = (
+            Path(appdata) / "Stellarium"
+            if appdata
+            else Path.home() / "AppData" / "Roaming" / "Stellarium"
+        )
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Stellarium"
+    else:
+        base = Path.home() / ".stellarium"
+    scripts_dir = base / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    return scripts_dir
+
+
+def resolve_cookies_path(cookies_path: str | Path | None = None) -> Path:
+    """Locate cookies.txt in the current working directory (where the script is launched)."""
+    if cookies_path is not None:
+        return Path(cookies_path).expanduser()
+    cwd_cookies = Path.cwd() / DEFAULT_COOKIES_PATH
+    if cwd_cookies.exists():
+        return cwd_cookies
+    script_cookies = Path(__file__).resolve().parent / DEFAULT_COOKIES_PATH
+    if script_cookies.exists():
+        return script_cookies
+    return cwd_cookies
+
+
+def download_rubin_mosaic(
+    visit_id: int | str,
+    rsp_server: str = DEFAULT_RSP_SERVER,
+    cookies_path: str | Path | None = None,
+    out_dir: str | Path = DEFAULT_IMAGE_DIR,
+) -> Path:
+    """Download RubinTV focal_plane_mosaic image using the logic from id_download.sh.
+
+    Parameters
+    ----------
+    visit_id : int or str
+        Visit ID string/int (uses first 13 characters: YYYYMMDD + 5-digit seq_num).
+    rsp_server : str
+        Base URL of the RSP server.
+    cookies_path : str, Path, or None
+        Path to cookies.txt (defaults to cookies.txt in the folder where the script is launched).
+    out_dir : str or Path
+        Directory where downloaded images are saved.
+
+    Returns
+    -------
+    Path
+        Path to `image_<ID:0:13>.jpg`.
+    """
+    id_str = str(visit_id).strip()
+    visit_13 = id_str[:13]
+
+    year = visit_13[0:4]
+    month = visit_13[4:6]
+    day = visit_13[6:8]
+    date_str = f"{year}-{month}-{day}"
+
+    img_num = int(visit_13[8:13], 10)
+    num_str = f"{img_num:06d}"
+
+    base_url = f"{rsp_server.rstrip('/')}{DEFAULT_RUBINTV_MOSAIC_PATH}"
+    prefix = f"lsstcam_focal_plane_mosaic_{date_str}_"
+    url = f"{base_url}/{prefix}{num_str}.jpg"
+
+    out_dir_path = Path(out_dir)
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+    outfile = out_dir_path / f"image_{visit_13}.jpg"
+
+    if outfile.exists() and outfile.stat().st_size > 1024:
+        with open(outfile, "rb") as f:
+            head = f.read(512)
+        if b"<html" not in head.lower() and b"<!doctype" not in head.lower():
+            print(f"Using cached image: {outfile}")
+            return outfile
+
+    cookies_file = resolve_cookies_path(cookies_path)
+    print(f"Downloading {visit_13}")
+
+    try:
+        subprocess.run(
+            ["curl", "-s", "-L", "-b", str(cookies_file), "-o", str(outfile), url],
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        session = requests.Session()
+        if cookies_file.exists():
+            jar = MozillaCookieJar(str(cookies_file))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session.cookies = jar
+        response = session.get(url, allow_redirects=True, timeout=30)
+        response.raise_for_status()
+        with open(outfile, "wb") as f:
+            f.write(response.content)
+
+    with open(outfile, "rb") as f:
+        head = f.read(512).lower()
+    if b"<html" in head or b"<!doctype html" in head:
+        print("  ⚠ Authentication failed (received HTML)")
+        raise RuntimeError(
+            f"Authentication failed when downloading {url} (received HTML). "
+            f"Check {cookies_file}."
+        )
+
+    return outfile
+
+
+def prepare_rubin_sky_image(
+    image_path: str | Path,
+    visit_id: int | str | None = None,
+    transparent_corners: bool = True,
+    opacity: float = DEFAULT_IMAGE_OPACITY,
+) -> tuple[str, Path]:
+    """Crop, orient, and mask a RubinTV focal_plane_mosaic image for Stellarium sky projection.
+
+    The RubinTV focal_plane_mosaic JPEG is a 1200x1200 matplotlib figure with title,
+    axes ticks, and a colorbar on the right. This function:
+      1. Detects and crops the interior of the focal plane square box.
+      2. Rotates 90 degrees clockwise (`ROTATE_270`) so the detector axes match
+         Stellarium's `core.loadSkyImage` and `MosaicCamera` (`LSSTCam.json`) convention
+         at `rotation = RotSkyPos`.
+      3. Applies the requested `opacity` (default `DEFAULT_IMAGE_OPACITY = 0.25`, i.e. 25%)
+         and masks the 4 empty white corner cutouts outside the rafts + corner wavefront
+         sensors with RGBA = (0, 0, 0, 0) so OpenGL additive blending renders them
+         completely transparent on the sky.
+      4. Saves the PNG inside Stellarium's user `scripts/` folder for `core.loadSkyImage`.
+
+    Returns
+    -------
+    script_rel_name : str
+        Filename relative to Stellarium's `scripts/` directory.
+    dest_path : Path
+        Full path to the prepared PNG file.
+    """
+    image_path = Path(image_path)
+    tag = str(visit_id).strip()[:13] if visit_id is not None else image_path.stem
+    script_rel_name = f"rubin_sky_{tag}.png"
+    dest_path = get_stellarium_scripts_dir() / script_rel_name
+
+    im = Image.open(image_path).convert("RGBA")
+    arr = np.array(im)
+    h, w, _ = arr.shape
+
+    # If this is a standard 1200x1200 RubinTV matplotlib plot, crop to the inner focal plane frame
+    gray = arr[:, :, :3].mean(axis=2)
+    horiz = np.where((gray[:, int(w * 0.08) : int(w * 0.75)] < 30).mean(axis=1) > 0.90)[
+        0
+    ]
+    vert = np.where((gray[int(h * 0.12) : int(h * 0.88), :] < 30).mean(axis=0) > 0.90)[
+        0
+    ]
+    if len(horiz) >= 2 and len(vert) >= 2:
+        y0 = int(horiz[0]) + 1
+        y1 = int(horiz[-1])
+        x0 = int(vert[0]) + 1
+        # Exclude colorbar vertical border at x > 0.905 * w
+        valid_vert = vert[vert < int(w * 0.905)]
+        x1 = int(valid_vert[-1]) if len(valid_vert) >= 2 else int(vert[1])
+        if (x1 - x0) > int(w * 0.5) and (y1 - y0) > int(h * 0.5):
+            im = im.crop((x0, y0, x1, y1))
+
+    # Rotate 90 deg clockwise so focal plane axes match Stellarium's core.loadSkyImage & LSSTCam.json
+    oriented = im.transpose(Image.Transpose.ROTATE_270).convert("RGBA")
+    m_arr = np.array(oriented)
+
+    # Apply opacity scaling (0.0 to 1.0) across RGB and Alpha channels for Stellarium additive blending
+    alpha_scale = float(np.clip(opacity, 0.0, 1.0))
+    if alpha_scale < 1.0:
+        m_arr = (m_arr.astype(np.float32) * alpha_scale).astype(np.uint8)
+
+    if transparent_corners:
+        mh, mw, _ = m_arr.shape
+        yn = np.linspace(1.0, -1.0, mh)[:, None]
+        xn = np.linspace(-1.0, 1.0, mw)[None, :]
+
+        # Exact geometric footprint of LSSTCam science rafts (3x5 + 5x3 cross)
+        in_science_cross = (np.abs(xn) <= 0.5985) | (np.abs(yn) <= 0.5985)
+
+        # Exact geometric footprint of the 4 corner wavefront sensor pairs (ITL_WF in LSSTCam.json)
+        in_wf_tl = (
+            (xn >= -0.744)
+            & (xn <= -0.610)
+            & (yn >= 0.606)
+            & (yn <= 0.748)
+            & ~((xn >= -0.680) & (xn <= -0.672))
+        )
+        in_wf_tr = (
+            (xn >= 0.606)
+            & (xn <= 0.748)
+            & (yn >= 0.610)
+            & (yn <= 0.744)
+            & ~((yn >= 0.672) & (yn <= 0.680))
+        )
+        in_wf_br = (
+            (xn >= 0.610)
+            & (xn <= 0.744)
+            & (yn >= -0.748)
+            & (yn <= -0.606)
+            & ~((xn >= 0.672) & (xn <= 0.680))
+        )
+        in_wf_bl = (
+            (xn >= -0.748)
+            & (xn <= -0.606)
+            & (yn >= -0.744)
+            & (yn <= -0.610)
+            & ~((yn >= -0.680) & (yn <= -0.672))
+        )
+
+        valid_footprint = in_science_cross | in_wf_tl | in_wf_tr | in_wf_br | in_wf_bl
+        # Zero both RGB and Alpha so Stellarium's additive sky blending renders corners transparent
+        m_arr[~valid_footprint] = 0
+
+    out_im = Image.fromarray(m_arr)
+    out_im.save(dest_path, format="PNG")
+    return script_rel_name, dest_path
+
+
+def clear_sky_image(url: str, layer_id: str = DEFAULT_SKY_LAYER_ID):
+    """Remove a plotted Rubin sky image from Stellarium."""
+    code = f'core.removeSkyImage("{layer_id}");'
+    requests.post(
+        f"{url}/api/scripts/direct", data={"code": code, "useIncludes": "false"}
+    )
+
+
+def plot_sky_image_to(
+    url: str,
+    camera: str,
+    ra: Angle,
+    dec: Angle,
+    rsp: Angle,
+    script_image_name: str,
+    layer_id: str = DEFAULT_SKY_LAYER_ID,
+    max_bright: float = 8.0,
+    show_grid: bool = False,
+):
+    """Plot the prepared Rubin focal plane image onto Stellarium's celestial sphere.
+
+    Updates MosaicCamera's position (so `status` and `actionSetViewToCamera` continue
+    to work identically), hides the empty blue/cyan detector wireframe grid unless
+    `show_grid=True`, and loads the real camera image at the exact sky coordinates and
+    RotSkyPos rotation.
+    """
+    if not np.isfinite(ra):
+        cprint(f"ra is not finite: {ra}", "bright_red")
+    if not np.isfinite(dec):
+        cprint(f"dec is not finite: {dec}", "bright_red")
+    if not np.isfinite(rsp):
+        cprint(f"rsp is not finite: {rsp}", "bright_red")
+
+    prop_url = f"{url}/api/stelproperty/set"
+    for data in [
+        {"id": "MosaicCamera.currentCamera", "value": camera},
+        {"id": "MosaicCamera.visible", "value": "True" if show_grid else "False"},
+        {"id": "MosaicCamera.ra", "value": ra.deg},
+        {"id": "MosaicCamera.dec", "value": dec.deg},
+        {"id": "MosaicCamera.rotation", "value": rsp.deg},
+        {"id": "StelSkyLayerMgr.flagShow", "value": "True"},
+    ]:
+        requests.post(prop_url, data=data)
+
+    ang_size_arcmin = float(
+        np.degrees(LSSTCAM_HALF_X_RAD + LSSTCAM_HALF_Y_RAD) * 60.0
+    )
+    rot_deg = float(rsp.deg % 360.0)
+
+    code = (
+        f'core.removeSkyImage("{layer_id}");\n'
+        f'core.loadSkyImage("{layer_id}", "{script_image_name}", '
+        f"{ra.deg:.8f}, {dec.deg:.8f}, {ang_size_arcmin:.4f}, {rot_deg:.6f}, "
+        f'100.0, {max_bright:.2f}, true, "EqJ2000", false);'
+    )
+    requests.post(
+        f"{url}/api/scripts/direct", data={"code": code, "useIncludes": "false"}
+    )
+
+
+def slew_to(url, camera, ra, dec, rsp, visible=True):
     """Send camera repositioning command to Stellarium.
 
     Parameters
@@ -256,6 +557,8 @@ def slew_to(url, camera, ra, dec, rsp):
         Declination.
     rsp : Angle
         Rotator sky position (E of N).
+    visible : bool, optional
+        Whether the MosaicCamera detector wireframe grid should be visible.
     """
     if not np.isfinite(ra):
         cprint(f"ra is not finite: {ra}", "bright_red")
@@ -267,7 +570,7 @@ def slew_to(url, camera, ra, dec, rsp):
     url = f"{url}/api/stelproperty/set"
     for data in [
         {"id": "MosaicCamera.currentCamera", "value": camera},
-        {"id": "MosaicCamera.visible", "value": "True"},
+        {"id": "MosaicCamera.visible", "value": "True" if visible else "False"},
         {"id": "MosaicCamera.ra", "value": ra.deg},
         {"id": "MosaicCamera.dec", "value": dec.deg},
         {"id": "MosaicCamera.rotation", "value": rsp.deg},
@@ -295,111 +598,6 @@ def parse_angle(value, unit=u.deg):
     except u.UnitsError:
         angle = Angle(value, unit=unit)
     return angle
-
-
-def _validate_day_obs(day_obs):
-    """Sanity-check that an 8-digit day_obs encodes a plausible date.
-
-    Parameters
-    ----------
-    day_obs : int
-        Date in YYYYMMDD form.
-
-    Raises
-    ------
-    click.BadParameter
-        If the embedded year/month/day are out of plausible range.
-    """
-    year, month, day = day_obs // 10000, (day_obs // 100) % 100, day_obs % 100
-    if not (2019 <= year <= 2035 and 1 <= month <= 12 and 1 <= day <= 31):
-        raise click.BadParameter(
-            f"day_obs {day_obs} does not encode a plausible date "
-            f"(expected YYYYMMDD with year 2019-2035)."
-        )
-
-
-def parse_visit_id(visit):
-    """Validate a 13-digit visit ID and return (visit, day_obs).
-
-    Visit IDs are YYYYMMDD followed by a 5-digit sequence number.
-
-    Parameters
-    ----------
-    visit : int
-        Visit ID to validate.
-
-    Returns
-    -------
-    visit : int
-        Validated visit ID.
-    day_obs : int
-        Embedded day_obs (YYYYMMDD).
-
-    Raises
-    ------
-    click.BadParameter
-        If the visit ID is not 13 digits or the embedded date is implausible.
-    """
-    s = str(visit)
-    if len(s) != 13:
-        raise click.BadParameter(
-            f"Visit ID must be 13 digits (YYYYMMDD + 5-digit sequence); "
-            f"got {len(s)} digits: {s!r}. "
-            f"Did you drop a leading zero on the sequence number?"
-        )
-    day_obs = int(s[:8])
-    _validate_day_obs(day_obs)
-    return int(visit), day_obs
-
-
-def parse_day_obs(day_obs):
-    """Validate an 8-digit day_obs (YYYYMMDD).
-
-    Parameters
-    ----------
-    day_obs : int
-        day_obs to validate.
-
-    Returns
-    -------
-    int
-        Validated day_obs.
-
-    Raises
-    ------
-    click.BadParameter
-        If day_obs is not 8 digits or encodes an implausible date.
-    """
-    s = str(day_obs)
-    if len(s) != 8:
-        raise click.BadParameter(
-            f"day_obs must be 8 digits (YYYYMMDD); got {len(s)}: {s!r}."
-        )
-    _validate_day_obs(int(day_obs))
-    return int(day_obs)
-
-
-def infer_camera(day_obs):
-    """Infer the camera in use from a day_obs.
-
-    Parameters
-    ----------
-    day_obs : int
-        Date in YYYYMMDD form.
-
-    Returns
-    -------
-    str
-        Inferred camera name.
-    """
-    if day_obs < 20241023:
-        return "LATISS"
-    elif day_obs < 20241212:
-        return "ComCam"
-    elif day_obs < 20250415:
-        return "LATISS"
-    else:
-        return "LSSTCam"
 
 
 def get_stellarium_attributes(url):
@@ -445,19 +643,14 @@ def get_stellarium_attributes(url):
     dec = properties["MosaicCamera.dec"]["value"]
     rsp = properties["MosaicCamera.rotation"]["value"]
     current_camera = properties["MosaicCamera.currentCamera"]["value"]
-    it = 0
     while any(x is None for x in [ra, dec, rsp, current_camera]):
         print("Waiting for Stellarium...")
-        print(f"ra: {ra}, dec: {dec}, rsp: {rsp}, current_camera: {current_camera}")
         sleep(0.5)
         properties = requests.get(f"{url}/api/stelproperty/list").json()
         ra = properties["MosaicCamera.ra"]["value"]
         dec = properties["MosaicCamera.dec"]["value"]
         rsp = properties["MosaicCamera.rotation"]["value"]
         current_camera = properties["MosaicCamera.currentCamera"]["value"]
-        it += 1
-        if it >= 5:
-            raise RuntimeError("Failed to get camera attributes from Stellarium.")
 
     ra = Angle(ra * u.deg).wrap_at("360d")
     dec = Angle(dec * u.deg)
@@ -487,35 +680,34 @@ def get_stellarium_attributes(url):
 
 
 def cprint(text, color=None):
-    if HAS_COLORAMA:
-        from colorama import Fore, Style
+    try:
+        if HAS_COLORAMA:
+            from colorama import Fore, Style
 
-        # All color names
-        colors = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+            # All color names
+            colors = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
 
-        # Generate the color dictionary programmatically
-        color_dict = {color: getattr(Fore, color.upper()) for color in colors}
-        color_dict.update(
-            {
-                f"bright_{color}": getattr(Fore, f"LIGHT{color.upper()}_EX")
-                for color in colors
-            }
-        )
+            # Generate the color dictionary programmatically
+            color_dict = {color: getattr(Fore, color.upper()) for color in colors}
+            color_dict.update(
+                {
+                    f"bright_{color}": getattr(Fore, f"LIGHT{color.upper()}_EX")
+                    for color in colors
+                }
+            )
 
-        # Get the color code from the dictionary
-        color_code = color_dict.get(color.lower(), "") if color else ""
-        print(f"{color_code}{text}{Style.RESET_ALL}")
-
-    else:
-        print(text)
+            # Get the color code from the dictionary
+            color_code = color_dict.get(color.lower(), "") if color else ""
+            print(f"{color_code}{text}{Style.RESET_ALL}")
+        else:
+            print(text)
+    except UnicodeEncodeError:
+        safe_text = text.replace("\u2032", "'").replace("\u2033", '"')
+        print(safe_text)
 
 
 def print_state(api_url):
-    try:
-        data = get_stellarium_attributes(api_url)
-    except RuntimeError:
-        cprint("Failed to get Stellarium attributes.", "bright_red")
-        return
+    data = get_stellarium_attributes(api_url)
 
     to_string_kwargs = dict(
         unit=u.deg,
@@ -582,7 +774,7 @@ def print_state(api_url):
 
 
 def set_view_to_camera(api_url):
-    """Set Stellarium view to camera.
+    """Set Stellarium view to camera and zoom to a sensible FOV if currently wide-field.
 
     Parameters
     ----------
@@ -590,6 +782,16 @@ def set_view_to_camera(api_url):
         URL of Stellarium API.
     """
     requests.post(f"{api_url}/api/stelaction/do", data={"id": "actionSetViewToCamera"})
+    try:
+        fov = requests.get(f"{api_url}/api/main/status", timeout=2).json()["view"]["fov"]
+        if fov > 25.0:
+            requests.post(
+                f"{api_url}/api/scripts/direct",
+                data={"code": "StelMovementMgr.zoomTo(10.0, 0.5);", "useIncludes": "false"},
+                timeout=2,
+            )
+    except Exception:
+        pass
 
 
 def set_stellarium_time(api_url, time, timerate=None):
@@ -679,9 +881,68 @@ def cli(ctx, url):
     is_flag=True,
     help="Do not follow the slew with a Stellarium view change.",
 )
+@click.option(
+    "--visit-image",
+    type=int,
+    default=None,
+    help="13-digit visit ID whose RubinTV focal plane image should be plotted instead of the detector grid.",
+)
+@click.option(
+    "--image-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Local Rubin focal plane image (.jpg/.png) to plot on the sky instead of the detector grid.",
+)
+@click.option(
+    "--cookies",
+    type=str,
+    default=None,
+    help=f"Path to cookies.txt for RubinTV download. [default: {DEFAULT_COOKIES_PATH}]",
+)
+@click.option(
+    "--rsp-server",
+    type=str,
+    default=DEFAULT_RSP_SERVER,
+    help=f"RSP server URL. [default: {DEFAULT_RSP_SERVER}]",
+)
+@click.option(
+    "--show-grid",
+    is_flag=True,
+    help="Also keep the blue/cyan detector wireframe grid visible on top of the plotted image.",
+)
+@click.option(
+    "--max-bright",
+    type=float,
+    default=8.0,
+    help="Stellarium surface brightness parameter for the plotted sky image. [default: 8.0]",
+)
+@click.option(
+    "--opacity",
+    type=float,
+    default=DEFAULT_IMAGE_OPACITY,
+    help=f"Opacity of the plotted Rubin sky image between 0.0 and 1.0. [default: {DEFAULT_IMAGE_OPACITY}]",
+)
 @click.pass_context
 def slew(
-    ctx, lon, lat, rot, time, timeformat, camera, horizon, rtp, rsp, ha, no_follow
+    ctx,
+    lon,
+    lat,
+    rot,
+    time,
+    timeformat,
+    camera,
+    horizon,
+    rtp,
+    rsp,
+    ha,
+    no_follow,
+    visit_image,
+    image_file,
+    cookies,
+    rsp_server,
+    show_grid,
+    max_bright,
+    opacity,
 ):
     """Slew mosaic to given position and rotation.
 
@@ -719,6 +980,8 @@ def slew(
         python tvs.py slew 0 0 0 --time 2024-04-08T00:00:00
 
         python tvs.py slew 0 0 0 --time 60408.0 --timeformat mjd
+
+        python tvs.py slew 12:34:56.7 -12:34:56.7 45 --visit-image 2026041100613
     """
     api_url = ctx.obj["URL"]
     extra_args = ctx.args
@@ -733,7 +996,8 @@ def slew(
         t = Time(time, format=timeformat)
         set_stellarium_time(api_url, t)
 
-    set_camera(api_url, camera)
+    use_image = (visit_image is not None) or (image_file is not None)
+    set_camera(api_url, camera, visible=not use_image or show_grid)
     data = get_stellarium_attributes(api_url)
     if horizon:
         # Interpret lon/lat/rot as Az/Alt/RotTelPos
@@ -771,7 +1035,32 @@ def slew(
                 rotSkyPos = q - parse_angle(rot) - 90 * u.deg
             else:
                 rotSkyPos = parse_angle(rot)
-    slew_to(api_url, camera, ra, dec, rotSkyPos)
+
+    if use_image:
+        raw_img = (
+            Path(image_file)
+            if image_file is not None
+            else download_rubin_mosaic(
+                visit_image, rsp_server=rsp_server, cookies_path=cookies
+            )
+        )
+        script_img_name, _ = prepare_rubin_sky_image(
+            raw_img, visit_id=visit_image, opacity=opacity
+        )
+        plot_sky_image_to(
+            api_url,
+            camera,
+            ra,
+            dec,
+            rotSkyPos,
+            script_img_name,
+            max_bright=max_bright,
+            show_grid=show_grid,
+        )
+    else:
+        clear_sky_image(api_url)
+        slew_to(api_url, camera, ra, dec, rotSkyPos)
+
     if not no_follow:
         set_view_to_camera(api_url)
 
@@ -812,8 +1101,65 @@ def slew(
     is_flag=True,
     help="Do not follow the slew with a Stellarium view change.",
 )
+@click.option(
+    "--visit-image",
+    type=int,
+    default=None,
+    help="13-digit visit ID whose RubinTV focal plane image should be plotted instead of the detector grid.",
+)
+@click.option(
+    "--image-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Local Rubin focal plane image (.jpg/.png) to plot on the sky instead of the detector grid.",
+)
+@click.option(
+    "--cookies",
+    type=str,
+    default=None,
+    help=f"Path to cookies.txt for RubinTV download. [default: {DEFAULT_COOKIES_PATH}]",
+)
+@click.option(
+    "--rsp-server",
+    type=str,
+    default=DEFAULT_RSP_SERVER,
+    help=f"RSP server URL. [default: {DEFAULT_RSP_SERVER}]",
+)
+@click.option(
+    "--show-grid",
+    is_flag=True,
+    help="Also keep the blue/cyan detector wireframe grid visible on top of the plotted image.",
+)
+@click.option(
+    "--max-bright",
+    type=float,
+    default=8.0,
+    help="Stellarium surface brightness parameter for the plotted sky image. [default: 8.0]",
+)
+@click.option(
+    "--opacity",
+    type=float,
+    default=DEFAULT_IMAGE_OPACITY,
+    help=f"Opacity of the plotted Rubin sky image between 0.0 and 1.0. [default: {DEFAULT_IMAGE_OPACITY}]",
+)
 @click.pass_context
-def target(ctx, name, rot, time, timeformat, camera, horizon, no_follow):
+def target(
+    ctx,
+    name,
+    rot,
+    time,
+    timeformat,
+    camera,
+    horizon,
+    no_follow,
+    visit_image,
+    image_file,
+    cookies,
+    rsp_server,
+    show_grid,
+    max_bright,
+    opacity,
+):
     """Slew to target by name.
 
     NAME is the name of the target (e.g., 'M20' or 'Trifid Nebula').
@@ -863,8 +1209,8 @@ def target(ctx, name, rot, time, timeformat, camera, horizon, no_follow):
     ra = Angle(result["ra"].data[0] * u.deg)
     dec = Angle(result["dec"].data[0] * u.deg)
 
-    data = get_stellarium_attributes(api_url)
     if horizon:
+        data = get_stellarium_attributes(api_url)
         time = data["time"]
         coord = SkyCoord(ra=ra, dec=dec, frame=ICRS)
         q = parallactic_angle(coord, time)
@@ -875,11 +1221,37 @@ def target(ctx, name, rot, time, timeformat, camera, horizon, no_follow):
         rsp = q - rtp - 90 * u.deg
     else:
         if rot is None:  # Keep current rsp
-            rsp = data["rsp"]
+            rsp = get_stellarium_attributes(api_url)["rsp"]
         else:
             rsp = parse_angle(rot)
 
-    slew_to(api_url, "LSSTCam" if camera == "ComCam" else camera, ra, dec, rsp)
+    stel_cam = "LSSTCam" if camera == "ComCam" else camera
+    use_image = (visit_image is not None) or (image_file is not None)
+    if use_image:
+        raw_img = (
+            Path(image_file)
+            if image_file is not None
+            else download_rubin_mosaic(
+                visit_image, rsp_server=rsp_server, cookies_path=cookies
+            )
+        )
+        script_img_name, _ = prepare_rubin_sky_image(
+            raw_img, visit_id=visit_image, opacity=opacity
+        )
+        plot_sky_image_to(
+            api_url,
+            stel_cam,
+            ra,
+            dec,
+            rsp,
+            script_img_name,
+            max_bright=max_bright,
+            show_grid=show_grid,
+        )
+    else:
+        clear_sky_image(api_url)
+        slew_to(api_url, stel_cam, ra, dec, rsp)
+
     if not no_follow:
         set_view_to_camera(api_url)
     print_state(api_url)
@@ -921,45 +1293,100 @@ def target(ctx, name, rot, time, timeformat, camera, horizon, no_follow):
     help="Offset to apply to the RotSkyPos (E of N) angle.",
     default=None,
 )
+@click.option(
+    "--grid-only",
+    is_flag=True,
+    help="Plot only the blue/cyan detector wireframe grid instead of downloading/plotting the real Rubin image.",
+)
+@click.option(
+    "--show-grid",
+    is_flag=True,
+    help="Overlay the blue/cyan detector wireframe grid on top of the real Rubin image.",
+)
+@click.option(
+    "--image-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Use a specific local Rubin image file (.jpg/.png) instead of downloading from RubinTV.",
+)
+@click.option(
+    "--cookies",
+    type=str,
+    default=None,
+    help=f"Path to cookies.txt for RubinTV download. [default: {DEFAULT_COOKIES_PATH}]",
+)
+@click.option(
+    "--max-bright",
+    type=float,
+    default=8.0,
+    help="Stellarium surface brightness parameter for the plotted sky image. [default: 8.0]",
+)
+@click.option(
+    "--opacity",
+    type=float,
+    default=DEFAULT_IMAGE_OPACITY,
+    help=f"Opacity of the plotted Rubin sky image between 0.0 and 1.0. [default: {DEFAULT_IMAGE_OPACITY}]",
+)
 @click.pass_context
 def visit(
-    ctx, visit, camera, force_consdb, rsp_token, rsp_server, no_follow, rot_offset
+    ctx,
+    visit,
+    camera,
+    force_consdb,
+    rsp_token,
+    rsp_server,
+    no_follow,
+    rot_offset,
+    grid_only,
+    show_grid,
+    image_file,
+    cookies,
+    max_bright,
+    opacity,
 ):
-    """Slew to match given visit ID.
+    """Slew to match given visit ID and plot the observed Rubin focal plane image on the sky.
 
     VISIT is the visit ID to slew to.
 
+    By default, for LSSTCam visits, downloads (or loads from cache) the RubinTV
+    focal_plane_mosaic image using cookies.txt (same logic as download_fromID.sh),
+    crops and aligns it to the celestial sphere with the exact RotSkyPos rotation,
+    and plots the real image in Stellarium in place of the empty detector grid.
+
     Some examples:
 
-        # Infer camera from date
+        # Plot real LSSTCam image for a visit on Stellarium's sky
+        python tvs.py visit 2026041100613
 
-        # ComCam
+        # Use a custom cookies.txt path or local image file
+        python tvs.py visit 2026041100613 --cookies cookies.txt
+        python tvs.py visit 2025110200011 --image-file image02_11.jpg
 
-        python tvs.py visit 2024121100608
+        # Show both the real image and the blue/cyan detector grid overlay
+        python tvs.py visit 2026041100613 --show-grid
 
-        # LATISS
-
-        python tvs.py visit 2025040300825
-
-        # Explicitly specify camera
-
-        python tvs.py visit 2024121100608 --camera ComCam
-
-        python tvs.py visit 2025040300825 --camera LATISS
-
-        python tvs.py visit 2025040300825 --camera LATISS --no-follow
+        # Plot only the original empty detector grid
+        python tvs.py visit 2026041100613 --grid-only
     """
     api_url = ctx.obj["URL"]
-
-    visit, day_obs = parse_visit_id(visit)
 
     token = get_access_token(rsp_token)
     consdb = ConsDB(rsp_server, token)
 
     # Override camera by date if possible:
     if camera is None:
-        camera = infer_camera(day_obs)
-        print(f"Inferring camera is {camera}")
+        if visit < 2024102300000:
+            print("Inferring camera is LATISS")
+            camera = "LATISS"
+        elif visit < 2024121200000:
+            print("Inferring camera is ComCam")
+            camera = "ComCam"
+        elif visit < 2025041500000:
+            print("Inferring camera is LATISS")
+            camera = "LATISS"
+        else:
+            print("Inferring camera is LSSTCam")
+            camera = "LSSTCam"
 
     if camera == "ComCam":
         database = "cdb_lsstcomcam"
@@ -994,27 +1421,47 @@ def visit(
     if ra is None:
         print("Using ConsDB for coordinates")
         query = f"select * from {database}.visit1 where visit_id = {visit}"
-        result = consdb.query(query)
-        if len(result) == 0:
-            raise click.ClickException(
-                f"No visit {visit} found in {database}.visit1. "
-                f"Check the visit ID and that the camera/database is correct "
-                f"(inferred camera: {camera})."
-            )
-        data = result[0]
+        data = consdb.query(query)[0]
         ra = Angle(data["s_ra"] * u.deg)
         dec = Angle(data["s_dec"] * u.deg)
         rsp = Angle(data["sky_rotation"] * u.deg)
         time = Time(data["exp_midpt_mjd"], format="mjd", scale="tai")
 
     rsp = rsp + rot_offset
-    slew_to(
-        api_url,
-        "LSSTCam" if camera == "ComCam" else camera,
-        ra,
-        dec,
-        rsp,
-    )
+    stel_cam = "LSSTCam" if camera == "ComCam" else camera
+
+    if not grid_only and (camera == "LSSTCam" or image_file is not None):
+        try:
+            raw_img = (
+                Path(image_file)
+                if image_file is not None
+                else download_rubin_mosaic(
+                    visit, rsp_server=rsp_server, cookies_path=cookies
+                )
+            )
+            script_img_name, _ = prepare_rubin_sky_image(
+                raw_img, visit_id=visit, opacity=opacity
+            )
+            plot_sky_image_to(
+                api_url,
+                stel_cam,
+                ra,
+                dec,
+                rsp,
+                script_img_name,
+                max_bright=max_bright,
+                show_grid=show_grid,
+            )
+        except Exception as exc:
+            cprint(
+                f"Could not plot Rubin sky image ({exc}); falling back to detector grid.",
+                "bright_red",
+            )
+            slew_to(api_url, stel_cam, ra, dec, rsp)
+    else:
+        clear_sky_image(api_url)
+        slew_to(api_url, stel_cam, ra, dec, rsp)
+
     # Set visit time and pause with timerate=0
     set_stellarium_time(api_url, time, timerate=0)
     if not no_follow:
@@ -1048,6 +1495,34 @@ def visit(
     is_flag=True,
     help="Do not follow the replay with a Stellarium view change.",
 )
+@click.option(
+    "--grid-only",
+    is_flag=True,
+    help="Plot only the blue/cyan detector wireframe grid instead of downloading/plotting the real Rubin images.",
+)
+@click.option(
+    "--show-grid",
+    is_flag=True,
+    help="Overlay the blue/cyan detector wireframe grid on top of the real Rubin images.",
+)
+@click.option(
+    "--cookies",
+    type=str,
+    default=None,
+    help=f"Path to cookies.txt for RubinTV download. [default: {DEFAULT_COOKIES_PATH}]",
+)
+@click.option(
+    "--max-bright",
+    type=float,
+    default=8.0,
+    help="Stellarium surface brightness parameter for the plotted sky image. [default: 8.0]",
+)
+@click.option(
+    "--opacity",
+    type=float,
+    default=DEFAULT_IMAGE_OPACITY,
+    help=f"Opacity of the plotted Rubin sky image between 0.0 and 1.0. [default: {DEFAULT_IMAGE_OPACITY}]",
+)
 @click.pass_context
 def replay(
     ctx,
@@ -1057,6 +1532,11 @@ def replay(
     rsp_token,
     rsp_server,
     no_follow,
+    grid_only,
+    show_grid,
+    cookies,
+    max_bright,
+    opacity,
 ):
     """Replay a range of days.
 
@@ -1065,20 +1545,25 @@ def replay(
     """
     api_url = ctx.obj["URL"]
 
-    day_obs_begin = parse_day_obs(day_obs_begin)
     if day_obs_end is None:
         day_obs_end = day_obs_begin
-    else:
-        day_obs_end = parse_day_obs(day_obs_end)
     if day_obs_end < day_obs_begin:
-        raise click.BadParameter(
-            "DAY_OBS_END must be greater than or equal to DAY_OBS_BEGIN"
-        )
+        raise ValueError("DAY_OBS_END must be greater than or equal to DAY_OBS_BEGIN")
 
     # Try to infer the camera
     if camera is None:
-        camera = infer_camera(day_obs_begin)
-        print(f"Inferring camera is {camera}")
+        if day_obs_end < 20241023:
+            print("Inferring camera is LATISS")
+            camera = "LATISS"
+        elif day_obs_end < 20241212 and day_obs_begin > 20241023:
+            print("Inferring camera is ComCam")
+            camera = "ComCam"
+        elif day_obs_end < 20250415 and day_obs_begin > 20241212:
+            print("Inferring camera is LATISS")
+            camera = "LATISS"
+        else:
+            print("Inferring camera is LSSTCam")
+            camera = "LSSTCam"
 
     token = get_access_token(rsp_token)
     consdb = ConsDB(rsp_server, token)
@@ -1096,31 +1581,16 @@ def replay(
         f"select * from {database}.visit1 where day_obs >= {day_obs_begin}"
         f" and day_obs <= {day_obs_end}"
     )
-    if len(visits) == 0:
-        raise click.ClickException(
-            f"No visits found in {database}.visit1 for day_obs range "
-            f"{day_obs_begin}-{day_obs_end} "
-            f"(inferred camera: {camera})."
-        )
-    visits["s_ra"] = visits["s_ra"].astype(float)
-    visits["s_dec"] = visits["s_dec"].astype(float)
-    visits["sky_rotation"] = visits["sky_rotation"].astype(float)
-    visits["exp_midpt_mjd"] = visits["exp_midpt_mjd"].astype(float)
 
     # Set stellarium time to first visit with can_see_sky True
-    can_see_sky = visits[visits["can_see_sky"]]
-    if len(can_see_sky) == 0:
-        raise click.ClickException(
-            f"No visits in day_obs range {day_obs_begin}-{day_obs_end} "
-            f"could see sky (can_see_sky is False for all)."
-        )
-    visit0 = can_see_sky[0]
+    visit0 = visits[visits["can_see_sky"]][0]
     set_stellarium_time(
         api_url,
         Time(visit0["exp_midpt_mjd"], format="mjd"),
         timerate=100 / 86400,
     )
 
+    stel_cam = "LSSTCam" if camera == "ComCam" else camera
     currentindex = None
     while True:
         time = get_stellarium_attributes(api_url)["time"]
@@ -1149,20 +1619,60 @@ def replay(
             ]
         )
         print_state(api_url)
-        if not all(
-            np.isfinite([visit[k] for k in ["s_ra", "s_dec", "sky_rotation"]])
-        ):
-            print("Skipping visit with non-finite coordinates")
-            continue
-        slew_to(
-            api_url,
-            "LSSTCam" if camera == "ComCam" else camera,
-            Angle(visit["s_ra"] * u.deg),
-            Angle(visit["s_dec"] * u.deg),
-            Angle(visit["sky_rotation"] * u.deg),
-        )
+        ra = Angle(visit["s_ra"] * u.deg)
+        dec = Angle(visit["s_dec"] * u.deg)
+        rsp = Angle(visit["sky_rotation"] * u.deg)
+        visit_id_val = int(visit["visit_id"])
+
+        if not grid_only and camera == "LSSTCam":
+            try:
+                raw_img = download_rubin_mosaic(
+                    visit_id_val, rsp_server=rsp_server, cookies_path=cookies
+                )
+                script_img_name, _ = prepare_rubin_sky_image(
+                    raw_img, visit_id=visit_id_val, opacity=opacity
+                )
+                plot_sky_image_to(
+                    api_url,
+                    stel_cam,
+                    ra,
+                    dec,
+                    rsp,
+                    script_img_name,
+                    max_bright=max_bright,
+                    show_grid=show_grid,
+                )
+            except Exception as exc:
+                cprint(
+                    f"Could not plot Rubin sky image ({exc}); falling back to detector grid.",
+                    "bright_red",
+                )
+                slew_to(api_url, stel_cam, ra, dec, rsp)
+        else:
+            clear_sky_image(api_url)
+            slew_to(api_url, stel_cam, ra, dec, rsp)
+
         if not no_follow:
             set_view_to_camera(api_url)
+
+
+@cli.command(name="clear-image")
+@click.option(
+    "--show-grid",
+    is_flag=True,
+    help="Re-enable the MosaicCamera detector wireframe grid after removing the sky image.",
+)
+@click.pass_context
+def clear_image_cmd(ctx, show_grid):
+    """Remove the plotted Rubin focal plane sky image from Stellarium."""
+    api_url = ctx.obj["URL"]
+    clear_sky_image(api_url)
+    if show_grid:
+        requests.post(
+            f"{api_url}/api/stelproperty/set",
+            data={"id": "MosaicCamera.visible", "value": "True"},
+        )
+    print("Removed Rubin sky image from Stellarium.")
 
 
 def query_efd_retry(efd, topic, time):
