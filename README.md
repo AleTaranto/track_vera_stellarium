@@ -20,14 +20,15 @@ tvs.py
 The Mosaic Camera plugin is also controllable over an http connection, which is where the tvs.py script comes in.  With this script you can:
 - slew the camera mosaic overlay to a given RA/DEC/RotSkyPos or Az/Alt/RotTelPos
 - slew to a target by name
-- slew to a specific past visit (requires access to the Rubin Consolidated Database)
-- replay a past night's observations (requires access to the Rubin Consolidated Database)
-- follow the Rubin (and LATISS) cameras in real time (accesses the Rubin Engineering Facilities Database)
+- slew to a specific past visit and overlay the observed Rubin focal plane image directly on the sky
+- replay a past night's observations
+- follow the Rubin (and LATISS) cameras or dome in real time (accesses the Rubin Engineering Facilities Database)
+- clear plotted sky images from Stellarium
 - display detailed status of the current camera overlay
 
 Note that for these functions to work optimally, you should set your Stellarium location to Cerro Pachón (Use F6).
 
-All functions require `click` and `astropy`.  Additionally, you'll need `astroquery` to slew to a target by name.  If you have the LSST Science Pipelines `summit_utils` package available, that'll be used to access the Rubin Consolidated Database (but I've added a rudimentary fallback if this is unavailable.)  Similarly, if `lsst_efd_client` is available, that'll be used to access the Rubin Engineering Facilities Database, but a rudimentary fallback also exists.
+All functions require `click`, `astropy`, and `Pillow`.  Additionally, you'll need `astroquery` to slew to a target by name.  If you have the LSST Science Pipelines `summit_utils` package available, that'll be used to access the Rubin Consolidated Database (but I've added a rudimentary fallback if this is unavailable.)  Similarly, if `lsst_efd_client` is available, that'll be used to access the Rubin Engineering Facilities Database, but a rudimentary fallback also exists.
 
 There's no installation.  The script is self-contained.  You can either call it with python a la `python tvs.py ...` or add your own [shebang](https://en.wikipedia.org/wiki/Shebang_(Unix)) to the beginning and just use `tvs.py ...`.
 
@@ -47,120 +48,107 @@ Will display the overall help message including listing available subcommands.
 
 python tvs.py slew
 ------------------
-The slew command will reposition and set visible a camera mosaic overlay.  For example:
+The slew command will reposition a camera mosaic overlay (or sky image).
 
 `python tvs.py slew 12:34:56.7 -12:34:56.7 45`
 
-Slew the LSSTCam mosaic overlay to RA 12h 34m 56.7s, Dec -12d 34m 56.7s and sets the sky rotation angle to 45 degrees (angle of the +Y axis in data visualization coordinate system (DVCS) measured from North through East).
+Slew LSSTCam to RA 12h 34m 56.7s, Dec -12d 34m 56.7s with RotSkyPos 45 deg.
 
 `python tvs.py slew 12:34:56.7 -12:34:56.7 45 --horizon`
 
-Slew the LSSTCam mosaic overlay to azimuth 12 _degrees_ 34m 56.7s, altitude -12d 34m 56.7s and sets the hardware rotation angle to 45 degrees (angle of -Y axis is the camera coordinate system (CCS) measured from +alt toward +az).
+Use horizon coordinates (Az/Alt/RotTelPos).
 
-Note you can use other strings that `astropy.coordinates.Angle` can interpret, e.g.,
-
-`python tvs.py slew 12h34m56.7 -12d34m56.7 45deg`
-
-`python tvs.py slew 12.5h -12.5d "45 deg"`
-
-To slew a camera other than LSSTCam, use the `--camera` argument, e.g.,
-
-`python tvs.py slew "185 deg" "12 deg" "0.5 rad" --camera LATISS`
-
-By default, the slew and some other commands will change the view within Stellarium to be centered around the newly positioned overlay.  To keep the view the same, use the `--no-follow` flag:
-
-`python tvs.py slew 12:34:56.7 -12:34:56.7 45 --no-follow`
-
-To also set the time inside of Stellarium, you can use
-
-`python tvs.py slew 0 0 0 --time 2024-04-08T00:00:00`
-
-`python tvs.py slew 0 0 0 --time 60408.0 --timeformat mjd`
+Options: `--camera`, `--no-follow`, `--time`, `--horizon`, `--visit-image`, `--image-file`, `--opacity`, `--show-grid`.
 
 
 python tvs.py target
 --------------------
-Pretty much the same as slew, but instead of providing spherical coords, provide a name to lookup via `astroquery`.  You can still set the rotator parameter as in `slew`.  Some examples:
-
-Keep current RotSkyPos
+Slew to a target by lookup name (via `astroquery`).
 
 `python tvs.py target M20`
 
-Set RotSkyPos to 45 degrees
-
-`python tvs.py target M20 45`
-
-Set RotTelPos to 45 degrees
-
-`python tvs.py target Trifid_Nebula 45 --horizon`
-
-And so on:
-
-`python tvs.py target M20 20deg`
-
-`python tvs.py target M20 "20 deg"`
-
 `python tvs.py target "Trifid Nebula" 45deg --camera LATISS`
 
-`python tvs.py target M20 45 --no-follow`
-
-`python tvs.py target M20 --time 2024-04-08T00:00:00`
-
-`python tvs.py target M20 --time 60408.0 --timeformat mjd`
+Options: `--camera`, `--horizon`, `--no-follow`, `--time`, `--visit-image`, `--image-file`, `--opacity`, `--show-grid`.
 
 
 python tvs.py visit
 -------------------
-The `visit` subcommand will look up a past visit in the Rubin Consolidated Database (ConsDB).  It will attempt to infer the correct camera based on the visit number, but you can also explicitly set one of ComCam, LSSTCam, or LATISS.
+The `visit` subcommand looks up a past visit in the Rubin Consolidated Database (ConsDB) or local `visits.ecsv` file, slews Stellarium to the pointing, sets the observation time, and projects the observed focal plane sky image onto Stellarium's celestial sphere.
 
-To access ConsDB, you must have a Rubin Science Platform security token.  (See https://nb.lsst.io/environment/tokens.html#using-a-token-outside-the-science-platform).  tvs.py will look for a token at `~/.lsst/rsp_token` by default, but you can specify a path explicitly with `--rsp-token`.
+### Sky Image Projection & RubinTV Downloads
+For LSSTCam visits, `visit` automatically downloads the corresponding RubinTV focal plane mosaic image using an authentication cookie file (`cookies.txt`). The image is processed (cropped, oriented, and masked so empty raft corners are transparent) and loaded directly onto the celestial sphere at the visit's exact RA, Dec, and RotSkyPos rotation angle. Downloaded images are cached in `images_rubin/`.
 
-Some examples:
+To access ConsDB, an RSP token is searched for at `~/.lsst/rsp_token` (or specified via `--rsp-token`). For downloading RubinTV images, place a valid `cookies.txt` file in your working directory or pass `--cookies`.
 
-Infers ComCam from date 2024-12-11
+### Options & Examples
 
-`python tvs.py visit 2024121100608`
+- **Basic visit lookup and sky image overlay:**
+  `python tvs.py visit 2026041100613`
 
-Infers LATISS from date 2025-04-03
+- **Show the detector wireframe grid on top of the real image:**
+  `python tvs.py visit 2026041100613 --show-grid`
 
-`python tvs.py visit 2025040300825`
+- **Plot only the detector wireframe grid (no image download):**
+  `python tvs.py visit 2026041100613 --grid-only`
 
-Specify camera explicitly
+- **Use a local image file instead of downloading:**
+  `python tvs.py visit 2025110200011 --image-file image02_11.jpg`
 
-`python tvs.py visit 2024121100608 --camera ComCam`
+- **Specify custom cookies or RSP token paths:**
+  `python tvs.py visit 2026041100613 --cookies /path/to/cookies.txt --rsp-token ~/.lsst/rsp_token`
 
-`python tvs.py visit 2025040300825 --camera LATISS`
+- **Adjust image opacity (0.0 to 1.0) or Stellarium surface brightness:**
+  `python tvs.py visit 2026041100613 --opacity 0.5 --max-bright 10.0`
 
-`python tvs.py visit 2025040300825 --camera LATISS --no-follow`
+- **Explicit camera selection or offset rotation:**
+  `python tvs.py visit 2024121100608 --camera ComCam`
+  `python tvs.py visit 2025040300825 --camera LATISS`
+  `python tvs.py visit 2026041100613 --rot-offset 90`
+
+- **Do not move Stellarium view focus:**
+  `python tvs.py visit 2026041100613 --no-follow`
 
 
 python tvs.py replay
 --------------------
-The `replay` subcommand takes a date (and optional camera), and uses the Stellarium internal clock to overlay the appropriate mosaic.  Like `visit`, this subcommand requires ConsDB access.  Some examples:
-
-Replay night of LSSTCam first photon:
+Replay observations for a range of dates. Automatically fetches visits from ConsDB and updates Stellarium's clock and sky images in sequence.
 
 `python tvs.py replay 20250415`
 
-Replay last two nights of ComCam:
-
 `python tvs.py replay 20241210 20241211`
+
+Options: `--camera`, `--grid-only`, `--show-grid`, `--cookies`, `--opacity`, `--no-follow`.
 
 
 python tvs.py follow
 --------------------
-The `follow` subcommand polls the Rubin Engineering Facilities Database (EFD) for the most recent pointing and rotation of either LSSTCam or LATISS to use to update the stellarium mosaic overlays.  The EFD is currently world public (though that may change) so no special credentials are required.  Example:
+Polls the Rubin Engineering Facilities Database (EFD) to track camera pointing in real time.
 
 `python tvs.py follow`
 
 `python tvs.py follow LATISS`
 
-If you want to follow both LSSTCam and LATISS, you can run in separate terminals both of the above (though you'll probably want to use `--no-follow` on at least one of them so the Stellarium view isn't constantly flipping back and forth between the two telescopes.)
+
+python tvs.py dome
+------------------
+Follows the actual Rubin dome azimuth position in real time via EFD.
+
+`python tvs.py dome`
+
+
+python tvs.py clear-image
+-------------------------
+Removes any plotted Rubin focal plane sky image from Stellarium.
+
+`python tvs.py clear-image`
+
+`python tvs.py clear-image --show-grid`
 
 
 python tvs.py status
 --------------------
-This command simply prints to stdout the current position (in both equatorial and horizon coordinates) of the specified camera overlay.  Example:
+Prints current position (equatorial and horizon coordinates, rates, and LST) to stdout.
 
 `python tvs.py status`
 
