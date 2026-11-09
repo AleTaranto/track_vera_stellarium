@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 from http.cookiejar import MozillaCookieJar
@@ -23,17 +24,20 @@ except ImportError:
     HAS_COLORAMA = False
 
 DEFAULT_STELLARIUM_URL = "http://localhost:8090"
-CAMERA_CHOICES = ["LSSTCam", "ComCam", "LATISS"]
+CAMERA_CHOICES = ["LSSTCam", "ComCam"]
 DEFAULT_RSP_SERVER = "https://usdf-rsp.slac.stanford.edu"
 DEFAULT_RSP_TOKEN_PATH = "~/.lsst/rsp_token"
 DEFAULT_EFD_CLIENT = "usdf_efd"
 DEFAULT_RUBINTV_MOSAIC_PATH = (
+    "/rubintv/event_image/summit-usdf/lsstcam/focal_plane_mosaic"
+)
+ALT_RUBINTV_MOSAIC_PATH = (
     "/rubintv/streamer-s3/usdf_Butler/lsstcam/focal_plane_mosaic"
 )
 DEFAULT_COOKIES_PATH = "cookies.txt"
 DEFAULT_IMAGE_DIR = "images_rubin"
 DEFAULT_SKY_LAYER_ID = "rubin_focal_plane"
-DEFAULT_IMAGE_OPACITY = 0.25  # Opacity of the plotted Rubin sky image (0.0 to 1.0, e.g. 0.25 = 25%)
+DEFAULT_IMAGE_OPACITY = 0.55  # Opacity of the plotted Rubin sky image (0.0 to 1.0, e.g. 0.25 = 25%)
 # Exact half-spans of LSSTCam focal plane in radians from Stellarium's LSSTCam.json
 LSSTCAM_HALF_X_RAD = 0.03069328
 LSSTCAM_HALF_Y_RAD = 0.03064734
@@ -279,16 +283,19 @@ def get_stellarium_scripts_dir() -> Path:
 
 
 def resolve_cookies_path(cookies_path: str | Path | None = None) -> Path:
-    """Locate cookies.txt in the current working directory (where the script is launched)."""
+    """Locate cookies.txt in current working dir, script dir, or Rubin workspace directory."""
     if cookies_path is not None:
         return Path(cookies_path).expanduser()
-    cwd_cookies = Path.cwd() / DEFAULT_COOKIES_PATH
-    if cwd_cookies.exists():
-        return cwd_cookies
-    script_cookies = Path(__file__).resolve().parent / DEFAULT_COOKIES_PATH
-    if script_cookies.exists():
-        return script_cookies
-    return cwd_cookies
+    candidate_paths = [
+        Path.cwd() / DEFAULT_COOKIES_PATH,
+        Path(__file__).resolve().parent / DEFAULT_COOKIES_PATH,
+        Path(r"\\wsl.localhost\Ubuntu\home\atara\rubin") / DEFAULT_COOKIES_PATH,
+        Path.home() / "rubin" / DEFAULT_COOKIES_PATH,
+    ]
+    for p in candidate_paths:
+        if p.exists():
+            return p
+    return candidate_paths[0]
 
 
 def download_rubin_mosaic(
@@ -297,76 +304,115 @@ def download_rubin_mosaic(
     cookies_path: str | Path | None = None,
     out_dir: str | Path = DEFAULT_IMAGE_DIR,
 ) -> Path:
-    """Download RubinTV focal_plane_mosaic image using the logic from id_download.sh.
+    """Download RubinTV focal_plane_mosaic image matching the download-by-id logic.
 
     Parameters
     ----------
     visit_id : int or str
-        Visit ID string/int (uses first 13 characters: YYYYMMDD + 5-digit seq_num).
+        Visit or exposure ID (e.g. 2026110400264, 20261104000264, or 2026-11-04_000264).
     rsp_server : str
         Base URL of the RSP server.
     cookies_path : str, Path, or None
-        Path to cookies.txt (defaults to cookies.txt in the folder where the script is launched).
+        Path to cookies.txt (defaults to cookies.txt in current or rubin folder).
     out_dir : str or Path
         Directory where downloaded images are saved.
 
     Returns
     -------
     Path
-        Path to `image_<ID:0:13>.jpg`.
+        Path to the downloaded or cached JPEG image.
     """
-    id_str = str(visit_id).strip()
-    visit_13 = id_str[:13]
+    clean_id = re.sub(r"\D", "", str(visit_id).strip())
+    if len(clean_id) < 9:
+        raise ValueError(
+            f"Invalid Rubin visit/exposure ID: '{visit_id}'. Expected format: YYYYMMDD + sequence number (e.g. 2026110400264 or 2026-11-04_000264)."
+        )
 
-    year = visit_13[0:4]
-    month = visit_13[4:6]
-    day = visit_13[6:8]
+    year = clean_id[0:4]
+    month = clean_id[4:6]
+    day = clean_id[6:8]
     date_str = f"{year}-{month}-{day}"
 
-    img_num = int(visit_13[8:13], 10)
+    img_num = int(clean_id[8:], 10)
     num_str = f"{img_num:06d}"
-
-    base_url = f"{rsp_server.rstrip('/')}{DEFAULT_RUBINTV_MOSAIC_PATH}"
-    prefix = f"lsstcam_focal_plane_mosaic_{date_str}_"
-    url = f"{base_url}/{prefix}{num_str}.jpg"
 
     out_dir_path = Path(out_dir)
     out_dir_path.mkdir(parents=True, exist_ok=True)
-    outfile = out_dir_path / f"image_{visit_13}.jpg"
+    outfile = out_dir_path / f"image_{clean_id}.jpg"
 
-    if outfile.exists() and outfile.stat().st_size > 1024:
-        with open(outfile, "rb") as f:
-            head = f.read(512)
-        if b"<html" not in head.lower() and b"<!doctype" not in head.lower():
-            print(f"Using cached image: {outfile}")
-            return outfile
+    # Check cache in common locations
+    candidate_cache = [
+        outfile,
+        out_dir_path / f"image_{clean_id[:13]}.jpg",
+        out_dir_path / f"image_{num_str}.jpg",
+        Path(f"images_{date_str}") / f"image_{num_str}.jpg",
+        Path(r"\\wsl.localhost\Ubuntu\home\atara\rubin") / f"images_{date_str}" / f"image_{num_str}.jpg",
+    ]
+    for cached in candidate_cache:
+        if cached.exists() and cached.stat().st_size > 1024:
+            try:
+                with open(cached, "rb") as f:
+                    head = f.read(512).lower()
+                if b"<html" not in head and b"<!doctype" not in head:
+                    print(f"Using cached image: {cached}")
+                    return cached
+            except Exception:
+                pass
 
     cookies_file = resolve_cookies_path(cookies_path)
-    print(f"Downloading {visit_13}")
+    prefix = f"lsstcam_focal_plane_mosaic_{date_str}_"
+    filename = f"{prefix}{num_str}.jpg"
 
-    try:
-        subprocess.run(
-            ["curl", "-s", "-L", "-b", str(cookies_file), "-o", str(outfile), url],
-            check=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        session = requests.Session()
-        if cookies_file.exists():
-            jar = MozillaCookieJar(str(cookies_file))
-            jar.load(ignore_discard=True, ignore_expires=True)
-            session.cookies = jar
-        response = session.get(url, allow_redirects=True, timeout=30)
-        response.raise_for_status()
-        with open(outfile, "wb") as f:
-            f.write(response.content)
+    server = rsp_server.rstrip("/")
+    primary_url = f"{server}{DEFAULT_RUBINTV_MOSAIC_PATH}/{filename}"
+    alt_url = f"{server}{ALT_RUBINTV_MOSAIC_PATH}/{filename}"
 
-    with open(outfile, "rb") as f:
-        head = f.read(512).lower()
-    if b"<html" in head or b"<!doctype html" in head:
-        print("  ⚠ Authentication failed (received HTML)")
+    print(f"Downloading RubinTV image for {clean_id} (Date: {date_str}, Sequence: {num_str})")
+
+    def _fetch_url(target_url: str) -> bool:
+        try:
+            cmd = ["curl", "-s", "-L", "-o", str(outfile)]
+            if cookies_file.exists():
+                cmd.extend(["-b", str(cookies_file)])
+            cmd.append(target_url)
+            subprocess.run(cmd, check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            session = requests.Session()
+            if cookies_file.exists():
+                jar = MozillaCookieJar(str(cookies_file))
+                jar.load(ignore_discard=True, ignore_expires=True)
+                session.cookies = jar
+            resp = session.get(target_url, allow_redirects=True, timeout=30)
+            if resp.status_code != 200:
+                return False
+            with open(outfile, "wb") as f:
+                f.write(resp.content)
+
+        if not outfile.exists() or outfile.stat().st_size <= 1024:
+            return False
+        with open(outfile, "rb") as f:
+            head = f.read(512).lower()
+        if b"<html" in head or b"<!doctype" in head:
+            return False
+        return True
+
+    success = _fetch_url(primary_url)
+    if not success:
+        print(f"Primary endpoint did not return valid image, trying alternate: {alt_url}")
+        success = _fetch_url(alt_url)
+
+    if not success:
+        if outfile.exists():
+            with open(outfile, "rb") as f:
+                head = f.read(512).lower()
+            if b"<html" in head or b"<!doctype" in head:
+                print("  ⚠ Authentication failed or image not found (received HTML)")
+                raise RuntimeError(
+                    f"Authentication failed or image not found when downloading {primary_url} (received HTML). "
+                    f"Check {cookies_file}."
+                )
         raise RuntimeError(
-            f"Authentication failed when downloading {url} (received HTML). "
-            f"Check {cookies_file}."
+            f"Failed to download image for visit {clean_id} from {primary_url} and {alt_url}."
         )
 
     return outfile
@@ -400,7 +446,11 @@ def prepare_rubin_sky_image(
         Full path to the prepared PNG file.
     """
     image_path = Path(image_path)
-    tag = str(visit_id).strip()[:13] if visit_id is not None else image_path.stem
+    tag = (
+        re.sub(r"\D", "", str(visit_id))[:13]
+        if visit_id is not None
+        else re.sub(r"[^\w\-.]", "_", image_path.stem)
+    )
     script_rel_name = f"rubin_sky_{tag}.png"
     dest_path = get_stellarium_scripts_dir() / script_rel_name
 
@@ -784,10 +834,10 @@ def set_view_to_camera(api_url):
     requests.post(f"{api_url}/api/stelaction/do", data={"id": "actionSetViewToCamera"})
     try:
         fov = requests.get(f"{api_url}/api/main/status", timeout=2).json()["view"]["fov"]
-        if fov > 25.0:
+        if fov > 3.0:
             requests.post(
                 f"{api_url}/api/scripts/direct",
-                data={"code": "StelMovementMgr.zoomTo(10.0, 0.5);", "useIncludes": "false"},
+                data={"code": "StelMovementMgr.zoomTo(5.0, 0.5);", "useIncludes": "false"},
                 timeout=2,
             )
     except Exception:
@@ -1258,7 +1308,7 @@ def target(
 
 
 @cli.command()
-@click.argument("visit", type=int)
+@click.argument("visit", type=str)
 @click.option(
     "--camera",
     type=click.Choice(CAMERA_CHOICES, case_sensitive=True),
@@ -1373,15 +1423,20 @@ def visit(
     token = get_access_token(rsp_token)
     consdb = ConsDB(rsp_server, token)
 
+    visit_clean = re.sub(r"\D", "", str(visit))
+    if not visit_clean:
+        raise ValueError(f"Invalid visit ID: '{visit}'")
+    visit_int = int(visit_clean)
+
     # Override camera by date if possible:
     if camera is None:
-        if visit < 2024102300000:
+        if visit_int < 2024102300000:
             print("Inferring camera is LATISS")
             camera = "LATISS"
-        elif visit < 2024121200000:
+        elif visit_int < 2024121200000:
             print("Inferring camera is ComCam")
             camera = "ComCam"
-        elif visit < 2025041500000:
+        elif visit_int < 2025041500000:
             print("Inferring camera is LATISS")
             camera = "LATISS"
         else:
@@ -1398,7 +1453,7 @@ def visit(
         raise ValueError(f"Unknown camera: {camera}")
 
     if rot_offset is None:
-        if visit > 2025041500000 and visit < 2025042200000:
+        if visit_int > 2025041500000 and visit_int < 2025042200000:
             rot_offset = Angle("-90d")
         else:
             rot_offset = Angle("0d")
@@ -1411,16 +1466,16 @@ def visit(
         except FileNotFoundError:
             print("visits.ecsv not found.  Using ConsDB for coordinates.")
         else:
-            if visit in table["visit"]:
+            if visit_int in table["visit"]:
                 print("Using visits.ecsv for coordinates")
-                row = table[table["visit"] == visit][0]
+                row = table[table["visit"] == visit_int][0]
                 ra = row["ra"]
                 dec = row["dec"]
                 rsp = row["rsp"]
                 time = row["time"]
     if ra is None:
         print("Using ConsDB for coordinates")
-        query = f"select * from {database}.visit1 where visit_id = {visit}"
+        query = f"select * from {database}.visit1 where visit_id = {visit_int}"
         data = consdb.query(query)[0]
         ra = Angle(data["s_ra"] * u.deg)
         dec = Angle(data["s_dec"] * u.deg)
@@ -1673,6 +1728,41 @@ def clear_image_cmd(ctx, show_grid):
             data={"id": "MosaicCamera.visible", "value": "True"},
         )
     print("Removed Rubin sky image from Stellarium.")
+
+
+@cli.command(name="download-image")
+@click.argument("image_id", type=str)
+@click.option(
+    "--rsp-server",
+    type=str,
+    help=f"RSP server URL. [default: {DEFAULT_RSP_SERVER}]",
+    default=DEFAULT_RSP_SERVER,
+)
+@click.option(
+    "--cookies",
+    type=str,
+    default=None,
+    help=f"Path to cookies.txt for RubinTV download. [default: {DEFAULT_COOKIES_PATH}]",
+)
+@click.option(
+    "--out-dir",
+    type=click.Path(),
+    default=DEFAULT_IMAGE_DIR,
+    help=f"Directory to save downloaded image. [default: {DEFAULT_IMAGE_DIR}]",
+)
+def download_image_cmd(image_id, rsp_server, cookies, out_dir):
+    """Download RubinTV focal_plane_mosaic JPEG by exposure/visit ID."""
+    try:
+        path = download_rubin_mosaic(
+            image_id,
+            rsp_server=rsp_server,
+            cookies_path=cookies,
+            out_dir=out_dir,
+        )
+        print(f"Downloaded successfully: {path}")
+    except Exception as exc:
+        cprint(f"Error downloading image: {exc}", "bright_red")
+        sys.exit(1)
 
 
 def query_efd_retry(efd, topic, time):
