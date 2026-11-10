@@ -37,6 +37,7 @@ ALT_RUBINTV_MOSAIC_PATH = (
 DEFAULT_COOKIES_PATH = "cookies.txt"
 DEFAULT_IMAGE_DIR = "images_rubin"
 DEFAULT_SKY_LAYER_ID = "rubin_focal_plane"
+ACTIVE_LAYERS_FILE = ".rubin_active_layers.txt"
 DEFAULT_IMAGE_OPACITY = 0.55  # Opacity of the plotted Rubin sky image (0.0 to 1.0, e.g. 0.25 = 25%)
 # Exact half-spans of LSSTCam focal plane in radians from Stellarium's LSSTCam.json
 LSSTCAM_HALF_X_RAD = 0.03069328
@@ -532,12 +533,71 @@ def prepare_rubin_sky_image(
     return script_rel_name, dest_path
 
 
-def clear_sky_image(url: str, layer_id: str = DEFAULT_SKY_LAYER_ID):
-    """Remove a plotted Rubin sky image from Stellarium."""
-    code = f'core.removeSkyImage("{layer_id}");'
-    requests.post(
-        f"{url}/api/scripts/direct", data={"code": code, "useIncludes": "false"}
-    )
+def get_active_layers_path() -> Path:
+    """Return path to file tracking active sky layer IDs."""
+    return get_stellarium_scripts_dir() / ACTIVE_LAYERS_FILE
+
+
+def record_active_layer(layer_id: str):
+    """Record an active sky layer ID."""
+    p = get_active_layers_path()
+    layers = get_active_layers()
+    layers.add(layer_id)
+    try:
+        p.write_text("\n".join(sorted(layers)))
+    except Exception:
+        pass
+
+
+def unrecord_active_layer(layer_id: str):
+    """Remove a layer ID from tracked active sky layer IDs."""
+    p = get_active_layers_path()
+    layers = get_active_layers()
+    if layer_id in layers:
+        layers.remove(layer_id)
+        try:
+            p.write_text("\n".join(sorted(layers)))
+        except Exception:
+            pass
+
+
+def get_active_layers() -> set[str]:
+    """Retrieve set of currently tracked sky layer IDs."""
+    p = get_active_layers_path()
+    if p.exists():
+        try:
+            lines = p.read_text().splitlines()
+            return {line.strip() for line in lines if line.strip()}
+        except Exception:
+            pass
+    return set()
+
+
+def clear_sky_image(url: str, layer_id: str | None = None):
+    """Remove plotted Rubin sky image(s) from Stellarium.
+
+    If `layer_id` is provided, remove only that specific layer.
+    If `layer_id` is None, remove all tracked active sky layers as well as
+    DEFAULT_SKY_LAYER_ID.
+    """
+    if layer_id is not None:
+        layers_to_remove = {layer_id}
+        unrecord_active_layer(layer_id)
+    else:
+        layers_to_remove = get_active_layers() | {DEFAULT_SKY_LAYER_ID}
+        p = get_active_layers_path()
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    remove_statements = [f'core.removeSkyImage("{lid}");' for lid in sorted(layers_to_remove)]
+    if remove_statements:
+        code = "\n".join(remove_statements)
+        requests.post(
+            f"{url}/api/scripts/direct", data={"code": code, "useIncludes": "false"}
+        )
 
 
 def plot_sky_image_to(
@@ -550,13 +610,14 @@ def plot_sky_image_to(
     layer_id: str = DEFAULT_SKY_LAYER_ID,
     max_bright: float = 8.0,
     show_grid: bool = False,
+    update_mosaic_camera: bool = True,
 ):
     """Plot the prepared Rubin focal plane image onto Stellarium's celestial sphere.
 
-    Updates MosaicCamera's position (so `status` and `actionSetViewToCamera` continue
-    to work identically), hides the empty blue/cyan detector wireframe grid unless
-    `show_grid=True`, and loads the real camera image at the exact sky coordinates and
-    RotSkyPos rotation.
+    Updates MosaicCamera's position if `update_mosaic_camera=True` (so `status` and
+    `actionSetViewToCamera` continue to work identically), hides the empty blue/cyan
+    detector wireframe grid unless `show_grid=True`, and loads the real camera image
+    at the exact sky coordinates and RotSkyPos rotation.
     """
     if not np.isfinite(ra):
         cprint(f"ra is not finite: {ra}", "bright_red")
@@ -566,20 +627,25 @@ def plot_sky_image_to(
         cprint(f"rsp is not finite: {rsp}", "bright_red")
 
     prop_url = f"{url}/api/stelproperty/set"
-    for data in [
-        {"id": "MosaicCamera.currentCamera", "value": camera},
-        {"id": "MosaicCamera.visible", "value": "True" if show_grid else "False"},
-        {"id": "MosaicCamera.ra", "value": ra.deg},
-        {"id": "MosaicCamera.dec", "value": dec.deg},
-        {"id": "MosaicCamera.rotation", "value": rsp.deg},
-        {"id": "StelSkyLayerMgr.flagShow", "value": "True"},
-    ]:
-        requests.post(prop_url, data=data)
+    if update_mosaic_camera:
+        for data in [
+            {"id": "MosaicCamera.currentCamera", "value": camera},
+            {"id": "MosaicCamera.visible", "value": "True" if show_grid else "False"},
+            {"id": "MosaicCamera.ra", "value": ra.deg},
+            {"id": "MosaicCamera.dec", "value": dec.deg},
+            {"id": "MosaicCamera.rotation", "value": rsp.deg},
+            {"id": "StelSkyLayerMgr.flagShow", "value": "True"},
+        ]:
+            requests.post(prop_url, data=data)
+    else:
+        requests.post(prop_url, data={"id": "StelSkyLayerMgr.flagShow", "value": "True"})
 
     ang_size_arcmin = float(
         np.degrees(LSSTCAM_HALF_X_RAD + LSSTCAM_HALF_Y_RAD) * 60.0
     )
     rot_deg = float(rsp.deg % 360.0)
+
+    record_active_layer(layer_id)
 
     code = (
         f'core.removeSkyImage("{layer_id}");\n'
@@ -1357,7 +1423,7 @@ def target(
     "--image-file",
     type=click.Path(exists=True),
     default=None,
-    help="Use a specific local Rubin image file (.jpg/.png) instead of downloading from RubinTV.",
+    help="Use a specific local Rubin image file (.jpg/.png) instead of downloading from RubinTV. (Applicable when a single visit ID is provided).",
 )
 @click.option(
     "--cookies",
@@ -1394,19 +1460,24 @@ def visit(
     max_bright,
     opacity,
 ):
-    """Slew to match given visit ID and plot the observed Rubin focal plane image on the sky.
+    """Slew to match given visit ID(s) and plot the observed Rubin focal plane image(s) on the sky.
 
-    VISIT is the visit ID to slew to.
+    VISIT is a visit ID or a comma-separated list of visit IDs to download and plot.
 
     By default, for LSSTCam visits, downloads (or loads from cache) the RubinTV
     focal_plane_mosaic image using cookies.txt (same logic as download_fromID.sh),
     crops and aligns it to the celestial sphere with the exact RotSkyPos rotation,
     and plots the real image in Stellarium in place of the empty detector grid.
+    When multiple comma-separated visit IDs are passed, each image is downloaded and
+    projected simultaneously onto Stellarium's celestial sphere as an independent layer.
 
     Some examples:
 
         # Plot real LSSTCam image for a visit on Stellarium's sky
         python tvs.py visit 2026041100613
+
+        # Plot multiple Rubin focal plane images at the same time
+        python tvs.py visit 2026041100613,2026041100614,2026041100615
 
         # Use a custom cookies.txt path or local image file
         python tvs.py visit 2026041100613 --cookies cookies.txt
@@ -1420,108 +1491,138 @@ def visit(
     """
     api_url = ctx.obj["URL"]
 
+    raw_items = [v.strip() for v in str(visit).split(",") if v.strip()]
+    if not raw_items:
+        raise ValueError(f"Invalid visit ID: '{visit}'")
+
+    visit_list = []
+    for item in raw_items:
+        v_clean = re.sub(r"\D", "", item)
+        if not v_clean:
+            raise ValueError(f"Invalid visit ID: '{item}'")
+        visit_list.append((item, v_clean, int(v_clean)))
+
     token = get_access_token(rsp_token)
     consdb = ConsDB(rsp_server, token)
 
-    visit_clean = re.sub(r"\D", "", str(visit))
-    if not visit_clean:
-        raise ValueError(f"Invalid visit ID: '{visit}'")
-    visit_int = int(visit_clean)
-
-    # Override camera by date if possible:
-    if camera is None:
-        if visit_int < 2024102300000:
-            print("Inferring camera is LATISS")
-            camera = "LATISS"
-        elif visit_int < 2024121200000:
-            print("Inferring camera is ComCam")
-            camera = "ComCam"
-        elif visit_int < 2025041500000:
-            print("Inferring camera is LATISS")
-            camera = "LATISS"
-        else:
-            print("Inferring camera is LSSTCam")
-            camera = "LSSTCam"
-
-    if camera == "ComCam":
-        database = "cdb_lsstcomcam"
-    elif camera == "LSSTCam":
-        database = "cdb_lsstcam"
-    elif camera == "LATISS":
-        database = "cdb_latiss"
-    else:
-        raise ValueError(f"Unknown camera: {camera}")
-
-    if rot_offset is None:
-        if visit_int > 2025041500000 and visit_int < 2025042200000:
-            rot_offset = Angle("-90d")
-        else:
-            rot_offset = Angle("0d")
-    rot_offset = parse_angle(rot_offset, unit=u.deg)
-
-    ra = None
+    visits_table = None
     if not force_consdb:
         try:
-            table = QTable.read("visits.ecsv")
+            visits_table = QTable.read("visits.ecsv")
         except FileNotFoundError:
-            print("visits.ecsv not found.  Using ConsDB for coordinates.")
+            pass
+
+    # Clear previously plotted sky layers if not appending, or clear all for fresh plot
+    clear_sky_image(api_url)
+
+    last_info = None
+
+    for idx, (raw_v, visit_clean, visit_int) in enumerate(visit_list):
+        cam = camera
+        # Override camera by date if possible:
+        if cam is None:
+            if visit_int < 2024102300000:
+                print(f"[{raw_v}] Inferring camera is LATISS")
+                cam = "LATISS"
+            elif visit_int < 2024121200000:
+                print(f"[{raw_v}] Inferring camera is ComCam")
+                cam = "ComCam"
+            elif visit_int < 2025041500000:
+                print(f"[{raw_v}] Inferring camera is LATISS")
+                cam = "LATISS"
+            else:
+                print(f"[{raw_v}] Inferring camera is LSSTCam")
+                cam = "LSSTCam"
+
+        if cam == "ComCam":
+            database = "cdb_lsstcomcam"
+        elif cam == "LSSTCam":
+            database = "cdb_lsstcam"
+        elif cam == "LATISS":
+            database = "cdb_latiss"
         else:
-            if visit_int in table["visit"]:
-                print("Using visits.ecsv for coordinates")
-                row = table[table["visit"] == visit_int][0]
-                ra = row["ra"]
-                dec = row["dec"]
-                rsp = row["rsp"]
-                time = row["time"]
-    if ra is None:
-        print("Using ConsDB for coordinates")
-        query = f"select * from {database}.visit1 where visit_id = {visit_int}"
-        data = consdb.query(query)[0]
-        ra = Angle(data["s_ra"] * u.deg)
-        dec = Angle(data["s_dec"] * u.deg)
-        rsp = Angle(data["sky_rotation"] * u.deg)
-        time = Time(data["exp_midpt_mjd"], format="mjd", scale="tai")
+            raise ValueError(f"Unknown camera: {cam}")
 
-    rsp = rsp + rot_offset
-    stel_cam = "LSSTCam" if camera == "ComCam" else camera
+        v_rot_offset = rot_offset
+        if v_rot_offset is None:
+            if 2025041500000 < visit_int < 2025042200000:
+                v_rot_offset = Angle("-90d")
+            else:
+                v_rot_offset = Angle("0d")
+        v_rot_offset = parse_angle(v_rot_offset, unit=u.deg)
 
-    if not grid_only and (camera == "LSSTCam" or image_file is not None):
-        try:
-            raw_img = (
-                Path(image_file)
-                if image_file is not None
-                else download_rubin_mosaic(
-                    visit, rsp_server=rsp_server, cookies_path=cookies
+        ra = None
+        dec = None
+        rsp = None
+        v_time = None
+        if visits_table is not None and visit_int in visits_table["visit"]:
+            print(f"[{raw_v}] Using visits.ecsv for coordinates")
+            row = visits_table[visits_table["visit"] == visit_int][0]
+            ra = row["ra"]
+            dec = row["dec"]
+            rsp = row["rsp"]
+            v_time = row["time"]
+
+        if ra is None:
+            print(f"[{raw_v}] Using ConsDB for coordinates")
+            query = f"select * from {database}.visit1 where visit_id = {visit_int}"
+            data = consdb.query(query)[0]
+            ra = Angle(data["s_ra"] * u.deg)
+            dec = Angle(data["s_dec"] * u.deg)
+            rsp = Angle(data["sky_rotation"] * u.deg)
+            v_time = Time(data["exp_midpt_mjd"], format="mjd", scale="tai")
+
+        rsp = rsp + v_rot_offset
+        stel_cam = "LSSTCam" if cam == "ComCam" else cam
+
+        # Determine layer id for this visit
+        layer_id = f"rubin_focal_plane_{visit_clean}" if len(visit_list) > 1 else DEFAULT_SKY_LAYER_ID
+        is_last = (idx == len(visit_list) - 1)
+
+        v_image_file = image_file if (len(visit_list) == 1 or image_file is not None) else None
+
+        if not grid_only and (cam == "LSSTCam" or v_image_file is not None):
+            try:
+                raw_img = (
+                    Path(v_image_file)
+                    if v_image_file is not None
+                    else download_rubin_mosaic(
+                        raw_v, rsp_server=rsp_server, cookies_path=cookies
+                    )
                 )
-            )
-            script_img_name, _ = prepare_rubin_sky_image(
-                raw_img, visit_id=visit, opacity=opacity
-            )
-            plot_sky_image_to(
-                api_url,
-                stel_cam,
-                ra,
-                dec,
-                rsp,
-                script_img_name,
-                max_bright=max_bright,
-                show_grid=show_grid,
-            )
-        except Exception as exc:
-            cprint(
-                f"Could not plot Rubin sky image ({exc}); falling back to detector grid.",
-                "bright_red",
-            )
-            slew_to(api_url, stel_cam, ra, dec, rsp)
-    else:
-        clear_sky_image(api_url)
-        slew_to(api_url, stel_cam, ra, dec, rsp)
+                script_img_name, _ = prepare_rubin_sky_image(
+                    raw_img, visit_id=raw_v, opacity=opacity
+                )
+                plot_sky_image_to(
+                    api_url,
+                    stel_cam,
+                    ra,
+                    dec,
+                    rsp,
+                    script_img_name,
+                    layer_id=layer_id,
+                    max_bright=max_bright,
+                    show_grid=show_grid,
+                    update_mosaic_camera=is_last,
+                )
+            except Exception as exc:
+                cprint(
+                    f"[{raw_v}] Could not plot Rubin sky image ({exc}); falling back to detector grid.",
+                    "bright_red",
+                )
+                slew_to(api_url, stel_cam, ra, dec, rsp, visible=True)
+        else:
+            slew_to(api_url, stel_cam, ra, dec, rsp, visible=True)
 
-    # Set visit time and pause with timerate=0
-    set_stellarium_time(api_url, time, timerate=0)
-    if not no_follow:
-        set_view_to_camera(api_url)
-    print_state(api_url)
+        last_info = (stel_cam, ra, dec, rsp, v_time)
+
+    if last_info is not None:
+        stel_cam, ra, dec, rsp, v_time = last_info
+        # Set visit time and pause with timerate=0
+        set_stellarium_time(api_url, v_time, timerate=0)
+        if not no_follow:
+            set_view_to_camera(api_url)
+        print_state(api_url)
 
 
 @cli.command()
