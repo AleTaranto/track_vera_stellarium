@@ -86,8 +86,9 @@ To access ConsDB, an RSP token is searched for at `~/.lsst/rsp_token` (or specif
 - **Basic visit lookup and sky image overlay:**
   `python tvs.py visit 2026041100613`
 
-- **Download and plot multiple visits simultaneously:**
+- **Download and plot multiple visits simultaneously (comma-separated or range):**
   `python tvs.py visit 2026041100613,2026041100614,2026041100615`
+  `python tvs.py visit 2026041100613-2026041100615`
 
 - **Show the detector wireframe grid on top of the real image:**
   `python tvs.py visit 2026041100613 --show-grid`
