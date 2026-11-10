@@ -1497,10 +1497,22 @@ def visit(
 
     visit_list = []
     for item in raw_items:
-        v_clean = re.sub(r"\D", "", item)
-        if not v_clean:
-            raise ValueError(f"Invalid visit ID: '{item}'")
-        visit_list.append((item, v_clean, int(v_clean)))
+        # Check if item is a range, e.g. start..end, start:end, or start-end
+        range_match = re.match(r"^(\d+)(?:\.\.|:|-)(\d+)$", item)
+        if range_match:
+            start_str, end_str = range_match.groups()
+            start_int = int(start_str)
+            end_int = int(end_str)
+            if start_int > end_int:
+                raise ValueError(f"Invalid visit range: {start_int} > {end_int}")
+            for v_val in range(start_int, end_int + 1):
+                v_str = str(v_val)
+                visit_list.append((v_str, v_str, v_val))
+        else:
+            v_clean = re.sub(r"\D", "", item)
+            if not v_clean:
+                raise ValueError(f"Invalid visit ID: '{item}'")
+            visit_list.append((item, v_clean, int(v_clean)))
 
     token = get_access_token(rsp_token)
     consdb = ConsDB(rsp_server, token)
